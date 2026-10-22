@@ -1,10 +1,8 @@
 # =============================================================================
-# app.py – Flut-App 0.5 · Weltweite Meeresspiegel- und Flutungssimulation
+# app.py – Flut-App 0.7 · Weltweite Meeresspiegel- und Flutungssimulation
 # Eine Datei. Badewannen-Modell auf Basis der AWS Terrain Tiles (inkl. Meeresboden).
-# Werkzeuge: Flutungsmodi, Überlaufhöhe, Senken, Profil, Strandlinien-Vergleich,
-# Animation (mit Kartenhintergrund), Markierungen, Overlays, 3D, Export, Link teilen.
-# Neu in 0.4: Header-Korrektur, Animation mit Satellit/OSM/Gelände-Hintergrund.
-# Neu in 0.5: 3D-Wasser aus denselben Daten wie die 2D-Karte (gleicher Modus/Ausschnitt).
+# Neu in 0.7: 3D-Wasser als Flächen (wie Karte), Animations-Player mit Play/Pause,
+#             Animation in gleichen Farben/Modus wie die 2D-Karte.
 # =============================================================================
 from __future__ import annotations
 
@@ -20,6 +18,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from folium import plugins
 from matplotlib import font_manager as fm
 from matplotlib.colors import LinearSegmentedColormap
@@ -44,7 +43,7 @@ st.set_page_config(page_title="Flut-App", page_icon="🌊", layout="wide")
 # =============================================================================
 # Konstanten
 # =============================================================================
-APP_VERSION = "0.5"
+APP_VERSION = "0.7"
 LEVEL_MIN, LEVEL_MAX = -11000.0, 5000.0
 DEFAULT_CENTER = [50.0, 8.0]
 DEFAULT_ZOOM = 5
@@ -61,10 +60,9 @@ EARTH_CIRC = 40075016.686
 MAX_LAT = 85.0511
 MAX_TILES = 24
 
-# Grobe Kennwerte für die Wasserbilanz (Größenordnungen)
-OCEAN_AREA_KM2 = 3.61e8      # Fläche der Ozeane
-OCEAN_VOL_KM3 = 1.335e9      # Volumen der Ozeane
-ICE_SLE_M = 68.0             # Meeresspiegel-Äquivalent allen Eises, ca. 65–70 m
+OCEAN_AREA_KM2 = 3.61e8
+OCEAN_VOL_KM3 = 1.335e9
+ICE_SLE_M = 68.0
 
 MODES = ["Wassertiefe", "Veränderung zu heute"]
 FLOOD_MODES = ["Badewanne (alles unter dem Wasserstand)",
@@ -79,18 +77,13 @@ COL_SHORE = (255, 215, 0)
 COL_L2 = (220, 40, 40)
 COL_BAND = (255, 235, 120)
 
-TEXTURES_3D = {
-    "Satellit (Esri)": ESRI_URL,
-    "OpenStreetMap": OSM_URL,
-    "Gelände (OpenTopoMap)": TOPO_URL,
-    "Ohne (nur Relief)": None,
-}
-BASEMAPS_ANIM = {
-    "Satellit (Esri)": (ESRI_URL, "© Esri World Imagery"),
-    "OpenStreetMap": (OSM_URL, "© OpenStreetMap-Mitwirkende"),
-    "Gelände (OpenTopoMap)": (TOPO_URL, "© OpenTopoMap, © OSM"),
-    "Nur Relief": (None, ""),
-}
+TEXTURES_3D = {"Satellit (Esri)": ESRI_URL, "OpenStreetMap": OSM_URL,
+               "Gelände (OpenTopoMap)": TOPO_URL, "Ohne (nur Relief)": None}
+BASEMAPS_ANIM = {"Satellit (Esri)": (ESRI_URL, "© Esri World Imagery"),
+                 "OpenStreetMap": (OSM_URL, "© OpenStreetMap-Mitwirkende"),
+                 "Gelände (OpenTopoMap)": (TOPO_URL, "© OpenTopoMap, © OSM"),
+                 "Nur Relief": (None, "")}
+ANIM_SPEEDS = {"langsam": 700, "mittel": 400, "schnell": 200}
 
 PRESETS = [("🌍 Heute", 0.0), ("🧊 Eiszeit −120 m", -120.0), ("🔥 Eis geschmolzen +70 m", 70.0)]
 PLACES = {
@@ -111,11 +104,11 @@ for _k, _v in dict(
         sinks_on=False, sinks_min=2.0, wms_url="", wms_layers="", xyz_url="", ovl_op=0.6,
         markers=[], drawn_line=None, areas={}, anim=None, terr=None,
         tex3d=list(TEXTURES_3D)[0], exag3d=3.0, pitch3d=55, bearing3d=0, water3d_mode=WATER3D_MODES[0],
-        anim_base=list(BASEMAPS_ANIM)[0], anim_hill=0.4).items():
+        anim_base=list(BASEMAPS_ANIM)[0], anim_hill=0.4, anim_lo=-100.0, anim_hi=100.0,
+        anim_steps=16, anim_speed="mittel").items():
     if _k not in S:
         S[_k] = _v.copy() if isinstance(_v, (list, dict)) else _v
 
-# --- Link-Parameter einmalig übernehmen (?lat=..&lon=..&zoom=..&level=..) ------
 if not S.get("_qp_done"):
     S["_qp_done"] = True
     try:
@@ -237,7 +230,6 @@ def pixel_size_m(z):
 
 
 def row_px(tiles, nrows):
-    """Pixelgröße (m) je Zeile, breitengradabhängig."""
     y = tiles[2] + (np.arange(nrows) + 0.5) / TILE
     lats = tile_to_lonlat(0.0, y, tiles[0])[1]
     return pixel_size_m(tiles[0]) * np.cos(np.radians(lats))
@@ -310,13 +302,31 @@ def edge_of(mask):
     return ndimage.binary_dilation(e)
 
 
-def water_rgba(dem, water, level, alpha, dref=None):
+def water_rgba(dem, water, level, alpha):
     a = int(round(255 * alpha))
     d = np.where(water, level - np.nan_to_num(dem), 0.0)
-    if dref is None:
-        dref = float(np.percentile(d[water], 95)) if water.any() else 1.0
+    dref = float(np.percentile(d[water], 95)) if water.any() else 1.0
     rgba = WATER_CMAP(np.clip(d / max(dref, 1e-3), 0, 1), bytes=True)
     rgba[..., 3] = np.where(water, a, 0).astype(np.uint8)
+    return rgba
+
+
+def colorize(dem, water, level, mode, alpha, shore):
+    """Gemeinsame Einfärbung für Karte und Animation (damit beide gleich aussehen)."""
+    valid = np.isfinite(dem)
+    a = int(round(255 * alpha))
+    if mode == MODES[0]:
+        rgba = water_rgba(dem, water, level, alpha)
+    else:
+        with np.errstate(invalid="ignore"):
+            sea = valid & (dem < 0)
+            below = valid & (dem < level)
+        rgba = np.zeros(dem.shape + (4,), np.uint8)
+        rgba[water & sea] = (*COL_OLD, int(a * 0.45))
+        rgba[water & ~sea] = (*COL_NEW, a)
+        rgba[sea & ~below] = (*COL_DRY, a)
+    if shore and water.any() and not water.all():
+        rgba[edge_of(water)] = (*COL_SHORE, 255)
     return rgba
 
 
@@ -339,14 +349,8 @@ def water_layer(tiles, level, mode, flood_mode, seed_rc, alpha, shore, level2, b
         below = valid & (dem < level)
         sea_today = valid & (dem < 0)
     new_flood, new_dry = water & ~sea_today, sea_today & ~below
+    rgba = colorize(dem, water, level, mode, alpha, False)
     a = int(round(255 * alpha))
-    if mode == MODES[0]:
-        rgba = water_rgba(dem, water, level, alpha)
-    else:
-        rgba = np.zeros(dem.shape + (4,), np.uint8)
-        rgba[water & sea_today] = (*COL_OLD, int(a * 0.45))
-        rgba[new_flood] = (*COL_NEW, a)
-        rgba[new_dry] = (*COL_DRY, a)
     if band:
         with np.errstate(invalid="ignore"):
             zone = valid & ~water & (np.abs(dem - level) <= band)
@@ -364,8 +368,7 @@ def water_layer(tiles, level, mode, flood_mode, seed_rc, alpha, shore, level2, b
     depth = np.where(water, level - np.nan_to_num(dem), 0.0)
     volume_km3 = float((depth * ra * 1e6).sum() / 1e9)
     n_bodies = int(ndimage.label(water)[1]) if water.any() else 0
-    land = valid & ~water
-    lab, n_land = ndimage.label(land)
+    lab, n_land = ndimage.label(valid & ~water)
     n_isl, isl_area = 0, 0.0
     if n_land:
         border = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
@@ -375,18 +378,15 @@ def water_layer(tiles, level, mode, flood_mode, seed_rc, alpha, shore, level2, b
             isl_area = float(ndimage.sum(np.broadcast_to(ra, dem.shape), lab, isl).sum())
     stats = dict(water=area(water), new_flood=area(new_flood), new_dry=area(new_dry),
                  volume=volume_km3, bodies=n_bodies, islands=n_isl, isl_area=isl_area)
-
     hill_png = None
     if hill:
-        hs = hillshade(dem, row_px(tiles, dem.shape[0]))
-        g = (hs * 255).astype(np.uint8)
+        g = (hillshade(dem, row_px(tiles, dem.shape[0])) * 255).astype(np.uint8)
         hill_png = to_png_bytes(np.dstack([g, g, g, np.where(valid, 255, 0).astype(np.uint8)]))
     return dict(png=to_png_bytes(rgba), hill_png=hill_png, bounds=bounds, stats=stats, missing=missing)
 
 
 @st.cache_data(show_spinner="Berechne abflusslose Senken …", max_entries=4)
 def filled_dem(tiles):
-    """Geländemodell mit vom Kartenrand her aufgefüllten Senken (= Überlaufhöhe je Zelle)."""
     dem, _, _ = load_mosaic(*tiles)
     z = dem.astype(np.float64)
     top = float(np.nanmax(z)) if np.isfinite(z).any() else 0.0
@@ -407,8 +407,7 @@ def sinks_layer(tiles, min_depth):
         t = np.clip(depth / max(float(np.percentile(depth[m], 95)), 1e-3), 0, 1)
         rgba[m, 0], rgba[m, 1], rgba[m, 2] = 150, 60, 200
         rgba[m, 3] = (90 + 140 * t[m]).astype(np.uint8)
-    ra = row_area_km2(tiles, dem.shape[0])[:, None]
-    return to_png_bytes(rgba), float((m * ra).sum())
+    return to_png_bytes(rgba)
 
 
 @st.cache_data(show_spinner="Berechne Flutkurve …", max_entries=8)
@@ -494,7 +493,7 @@ def haversine(lat1, lon1, lat2, lon2):
 
 @st.cache_data(show_spinner="Berechne Höhenprofil …", max_entries=20)
 def sample_profile(coords, n=400):
-    pts = np.asarray(coords, float)            # [lon, lat]
+    pts = np.asarray(coords, float)
     seg = haversine(pts[:-1, 1], pts[:-1, 0], pts[1:, 1], pts[1:, 0])
     cum = np.concatenate([[0.0], np.cumsum(seg)])
     total = float(cum[-1])
@@ -502,13 +501,11 @@ def sample_profile(coords, n=400):
         return None
     d = np.linspace(0, total, n)
     lon, lat = np.interp(d, cum, pts[:, 0]), np.interp(d, cum, pts[:, 1])
-    step = total / n
     z = int(np.clip(math.floor(math.log2(EARTH_CIRC * math.cos(math.radians(float(lat.mean())))
-                                         / (TILE * max(step, 1.0)))), 0, MAX_TILE_ZOOM))
+                                         / (TILE * max(total / n, 1.0)))), 0, MAX_TILE_ZOOM))
     elev = [elevation_at(float(a), float(b), z) for a, b in zip(lat, lon)]
-    df = pd.DataFrame({"distanz_km": d / 1000, "lat": lat, "lon": lon,
-                       "hoehe_m": pd.Series(elev, dtype=float)})
-    return df, z
+    return pd.DataFrame({"distanz_km": d / 1000, "lat": lat, "lon": lon,
+                         "hoehe_m": pd.Series(elev, dtype=float)}), z
 
 
 # --- Animation -------------------------------------------------------------------
@@ -530,7 +527,6 @@ def _fetch_base_tile(url, z, x, y):
 
 
 def base_mosaic(url, z, tx0, ty0, tx1, ty1):
-    """Kartenkacheln für exakt denselben Ausschnitt wie das Höhenmodell."""
     n = 2 ** z
     rows = []
     for ty in range(ty0, ty1 + 1):
@@ -547,7 +543,8 @@ def base_mosaic(url, z, tx0, ty0, tx1, ty1):
 
 @st.cache_data(show_spinner="Erzeuge Animation …", max_entries=3)
 def make_animation(tiles, lo, hi, steps, flood_mode, seed_rc, alpha, duration_ms,
-                   basemap, hill_mix, max_dim=900):
+                   basemap, hill_mix, mode, shore, max_dim=900):
+    """Bilder in denselben Farben/Modus wie die 2D-Karte. Rückgabe: [(Stand, JPEG)], GIF."""
     dem, _, _ = load_mosaic(*tiles)
     s = max(1, math.ceil(max(dem.shape) / max_dim))
     d = dem[::s, ::s]
@@ -560,13 +557,12 @@ def make_animation(tiles, lo, hi, steps, flood_mode, seed_rc, alpha, duration_ms
     else:
         base = np.dstack([(hs * 190 + 50)] * 3).astype(np.float32) / 255.0
     seed = (seed_rc[0] // s, seed_rc[1] // s) if seed_rc else None
-    dref = max(hi - lo, 1.0)
     font = _font(max(14, d.shape[1] // 32))
     small = _font(max(10, d.shape[1] // 70))
     frames, pils = [], []
     for lv in np.linspace(lo, hi, steps):
         w = compute_water(d, lv, flood_mode, seed)
-        top = water_rgba(d, w, lv, alpha, dref).astype(np.float32) / 255.0
+        top = colorize(d, w, lv, mode, alpha, shore).astype(np.float32) / 255.0
         ta = top[..., 3:4]
         rgb = ((top[..., :3] * ta + base * (1 - ta)) * 255 + 0.5).astype(np.uint8)
         img = Image.fromarray(rgb, "RGB")
@@ -581,7 +577,7 @@ def make_animation(tiles, lo, hi, steps, flood_mode, seed_rc, alpha, duration_ms
             draw.rectangle([x0 - 4, y0 - 3, img.width - 6, img.height - 5], fill=(255, 255, 255))
             draw.text((x0 - ab[0], y0 - ab[1]), attribution, fill=(60, 60, 60), font=small)
         buf = io.BytesIO()
-        img.save(buf, format="PNG")
+        img.save(buf, format="JPEG", quality=85)
         frames.append((float(lv), buf.getvalue()))
         pils.append(img.quantize(colors=255))
     gif = io.BytesIO()
@@ -590,44 +586,70 @@ def make_animation(tiles, lo, hi, steps, flood_mode, seed_rc, alpha, duration_ms
     return frames, gif.getvalue()
 
 
+PLAYER_HTML = """
+<div style="font-family:sans-serif">
+ <img id="im" style="width:100%;height:__H__px;object-fit:contain;background:#eef3f7;border-radius:10px">
+ <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+  <button id="pp" style="padding:6px 14px;border-radius:8px;border:1px solid #1f6fb2;background:#1f6fb2;color:#fff;cursor:pointer">▶ Abspielen</button>
+  <button id="pv" style="padding:6px 10px;border-radius:8px;border:1px solid #bbb;cursor:pointer">⏮</button>
+  <button id="nx" style="padding:6px 10px;border-radius:8px;border:1px solid #bbb;cursor:pointer">⏭</button>
+  <input id="sl" type="range" min="0" max="__MAX__" value="0" style="flex:1">
+  <span id="lb" style="min-width:190px;font-weight:600;color:#10233A"></span>
+ </div>
+</div>
+<script>
+const imgs = __IMGS__, lbs = __LBS__, dur = __DUR__;
+const im = document.getElementById("im"), sl = document.getElementById("sl"),
+      lb = document.getElementById("lb"), pp = document.getElementById("pp");
+let i = 0, t = null;
+function show(k) { i = (k + imgs.length) % imgs.length; im.src = imgs[i]; sl.value = i; lb.textContent = lbs[i]; }
+function stop() { if (t) { clearInterval(t); t = null; } pp.textContent = "▶ Abspielen"; }
+pp.onclick = () => { if (t) { stop(); } else { t = setInterval(() => show(i + 1), dur); pp.textContent = "⏸ Pause"; } };
+document.getElementById("pv").onclick = () => { stop(); show(i - 1); };
+document.getElementById("nx").onclick = () => { stop(); show(i + 1); };
+sl.oninput = () => { stop(); show(parseInt(sl.value)); };
+show(0);
+</script>
+"""
+
+
+def anim_player(frames, duration_ms, height=MAP_HEIGHT):
+    imgs = ["data:image/jpeg;base64," + base64.b64encode(b).decode() for _, b in frames]
+    lbs = [f"Wasserstand {de_num(lv, 0, True)} m ({k + 1}/{len(frames)})" for k, (lv, _) in enumerate(frames)]
+    html = (PLAYER_HTML.replace("__IMGS__", json.dumps(imgs)).replace("__LBS__", json.dumps(lbs))
+            .replace("__DUR__", str(int(duration_ms))).replace("__MAX__", str(len(frames) - 1))
+            .replace("__H__", str(int(height))))
+    components.html(html, height=int(height) + 70)
+
+
 # --- 3D ------------------------------------------------------------------------------
-def _linear_lat_rows(arr, tiles, rows):
-    """Zeilen von Web-Mercator auf gleichmäßige Breitengrade umrechnen (für das 3D-Bild)."""
-    z, _, ty0, _, ty1 = tiles
-    lat = tile_to_lonlat(0.0, ty0 + (rows + 0.5) / TILE, z)[1]
-    north = float(tile_to_lonlat(0.0, ty0, z)[1])
-    south = float(tile_to_lonlat(0.0, ty1 + 1, z)[1])
-    n = len(rows)
-    target = north - (np.arange(n) + 0.5) * (north - south) / n
-    idx = np.interp(target, lat[::-1], np.arange(n)[::-1])
-    return arr[np.clip(np.round(idx).astype(int), 0, n - 1)]
-
-
 @st.cache_data(show_spinner="Bereite 3D-Wasser vor …", max_entries=6)
-def water_surface_3d(tiles, level, flood_mode, seed_rc, alpha, max_dim=1024):
-    """Wasseroberfläche aus denselben Daten wie die 2D-Karte (gleicher Modus, gleiche Kacheln)."""
-    dem, bounds, _ = load_mosaic(*tiles)
+def water_polygons_3d(tiles, level, flood_mode, seed_rc, max_dim=600, max_polys=400, max_pts=800):
+    """Wasser-Umrisse aus denselben Daten wie die 2D-Karte. Inseln werden gefüllt –
+    das höhere Gelände verdeckt die Wasserfläche dort ohnehin."""
+    dem, _, _ = load_mosaic(*tiles)
     water = compute_water(dem, level, flood_mode, seed_rc)
-    rgba = water_rgba(dem, water, level, alpha)
-    fill = float(np.nanmin(dem)) if np.isfinite(dem).any() else 0.0
-    d = np.where(np.isfinite(dem), dem, fill)
-    surf = np.where(water, level, d - 1.0)          # trocken: knapp unter dem Gelände und transparent
+    n_wet = int(water.sum())
+    if not n_wet:
+        return [], 0
     s = max(1, math.ceil(max(dem.shape) / max_dim))
-    rows = np.arange(0, dem.shape[0], s)
-    surf = _linear_lat_rows(surf[::s, ::s], tiles, rows)
-    rgba = _linear_lat_rows(rgba[::s, ::s], tiles, rows)
-    v = np.clip(surf + 32768.0, 0, 65535.99)        # Terrarium-Kodierung
-    r = np.floor(v / 256.0)
-    g = np.floor(v) - r * 256.0
-    b = np.floor((v - np.floor(v)) * 256.0)
-    elev = np.dstack([r, g, b]).astype(np.uint8)
-    return to_uri(to_png_bytes(elev)), to_uri(to_png_bytes(rgba)), bounds, int(water.sum())
+    w = ndimage.binary_fill_holes(water[::s, ::s])
+    pad = np.pad(w, 1, constant_values=False).astype(np.float32)
+    polys = []
+    for c in sorted(find_contours(pad, 0.5), key=len, reverse=True)[:max_polys]:
+        if len(c) < 4:
+            continue
+        c = c[::max(1, len(c) // max_pts)]
+        rows = (c[:, 0] - 1) * s + (s - 1) / 2
+        cols = (c[:, 1] - 1) * s + (s - 1) / 2
+        lon, lat = pixel_to_lonlat(tiles, rows, cols)
+        polys.append([[round(float(a), 6), round(float(b), 6)] for a, b in zip(lon, lat)])
+    return polys, n_wet
 
 
-def build_deck(lat, lon, zoom, level, exag, alpha, texture, pitch, bearing, water3d=None):
-    """3D-Gelände + Wasser. water3d = (Höhenbild, Wasserbild, Ausdehnung) oder None für einfache Ebene."""
+def build_deck(lat, lon, zoom, level, exag, alpha, texture, pitch, bearing, water_polys=None):
     dec = {"rScaler": 256 * exag, "gScaler": 1 * exag, "bScaler": exag / 256, "offset": -32768 * exag}
-    kw = dict(elevation_decoder=dec, elevation_data=TERRARIUM_URL, max_zoom=15,
+    kw = dict(elevation_decoder=dec, elevation_data=TERRARIUM_URL, max_zoom=15, mesh_max_error=2.0,
               wireframe=False, pickable=False)
     tex_url = TEXTURES_3D.get(texture)
     if tex_url:
@@ -635,20 +657,19 @@ def build_deck(lat, lon, zoom, level, exag, alpha, texture, pitch, bearing, wate
     else:
         kw["color"] = [200, 190, 170]
     layers = [pdk.Layer("TerrainLayer", **kw)]
-
-    if water3d:
-        elev_uri, tex_uri, b = water3d              # b = (S, W, N, O)
-        layers.append(pdk.Layer("TerrainLayer", id="wasser3d", elevation_data=elev_uri, texture=tex_uri,
-                                bounds=[b[1], b[0], b[3], b[2]], elevation_decoder=dec,
-                                mesh_max_error=1.0, wireframe=False, pickable=False))
+    h = level * exag
+    fill = [30, 120, 220, int(255 * alpha)]
+    if water_polys is not None:
+        if water_polys:
+            data = [{"polygon": [[x, y, h] for x, y in p]} for p in water_polys]
+            layers.append(pdk.Layer("PolygonLayer", data=data, get_polygon="polygon", get_fill_color=fill,
+                                    stroked=False, filled=True, extruded=False, pickable=False))
     else:
         span = float(np.clip(360.0 / 2 ** zoom * 3, 0.5, 80.0))
-        h = level * exag
         s, n = max(lat - span, -85.0), min(lat + span, 85.0)
         w, e = lon - span * 2, lon + span * 2
-        layers.append(pdk.Layer("PolygonLayer",
-                                data=[{"polygon": [[w, s, h], [e, s, h], [e, n, h], [w, n, h]]}],
-                                get_polygon="polygon", get_fill_color=[30, 120, 220, int(255 * alpha)],
+        layers.append(pdk.Layer("PolygonLayer", data=[{"polygon": [[w, s, h], [e, s, h], [e, n, h], [w, n, h]]}],
+                                get_polygon="polygon", get_fill_color=fill,
                                 stroked=False, filled=True, extruded=False, pickable=False))
     view = pdk.ViewState(latitude=lat, longitude=lon, zoom=zoom, pitch=pitch, bearing=bearing, max_pitch=85)
     return pdk.Deck(layers=layers, initial_view_state=view, map_style=None)
@@ -660,6 +681,13 @@ def build_deck(lat, lon, zoom, level, exag, alpha, texture, pitch, bearing, wate
 def de_num(v, nd=1, sign=False):
     s = f"{v:{'+' if sign else ''},.{nd}f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def show_img(img, caption=None):
+    try:
+        st.image(img, caption=caption, use_container_width=True)
+    except TypeError:
+        st.image(img, caption=caption, use_column_width=True)
 
 
 def approx_view(center, zoom, w=1200, h=MAP_HEIGHT):
@@ -702,6 +730,11 @@ def calc_now():
     S.calc_view = S.view
 
 
+def anim_around():
+    S.anim_lo = float(max(LEVEL_MIN, S.level - 100))
+    S.anim_hi = float(min(LEVEL_MAX, S.level + 100))
+
+
 @st.cache_data(show_spinner=False, max_entries=100)
 def geocode(q):
     r = requests.get("https://nominatim.openstreetmap.org/search", params=dict(q=q, format="json", limit=1),
@@ -718,7 +751,6 @@ def markers_geojson():
 
 
 def build_map():
-    """Grundkarte mit Werkzeugen – bleibt gleich, damit sie nicht neu geladen wird."""
     m = folium.Map(location=DEFAULT_CENTER, zoom_start=DEFAULT_ZOOM, tiles=None,
                    world_copy_jump=True, control_scale=True, min_zoom=2)
     folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
@@ -752,18 +784,15 @@ with st.sidebar:
                     key="level_input", on_change=lambda: set_level(S.level_input))
     bc = st.columns(6)
     for i, d in enumerate([-100, -10, -1, 1, 10, 100]):
-        bc[i].button(f"{d:+d}", key=f"lv_{d}", on_click=shift_level, args=(float(d),),
-                     use_container_width=True)
+        bc[i].button(f"{d:+d}", key=f"lv_{d}", on_click=shift_level, args=(float(d),), use_container_width=True)
     for label, lv in PRESETS:
         st.button(label, key=f"pre_{lv}", on_click=set_level, args=(lv,), use_container_width=True)
 
     with st.expander("🧭 Flutungsmodus", expanded=True):
         st.radio("Wie breitet sich das Wasser aus?", FLOOD_MODES, key="flood_mode",
-                 help="Badewanne: jede tiefe Stelle wird blau. Vom Kartenrand: nur Wasser, das mit dem Rand "
-                      "des Ausschnitts verbunden ist (abgeschlossene Becken bleiben trocken). Ab Startpunkt: "
-                      "nur das Becken des zuletzt angeklickten Punkts.")
-        st.checkbox("Klick-Abfrage aktiv", key="click_on",
-                    help="Zum Zeichnen von Profillinien vorübergehend ausschalten.")
+                 help="Badewanne: jede tiefe Stelle wird blau. Vom Kartenrand: nur Wasser mit Verbindung zum Rand "
+                      "des Ausschnitts. Ab Startpunkt: nur das Becken des zuletzt angeklickten Punkts.")
+        st.checkbox("Klick-Abfrage aktiv", key="click_on", help="Zum Zeichnen von Profillinien ausschalten.")
 
     with st.expander("🎨 Darstellung"):
         st.radio("Ansicht", MODES, key="mode")
@@ -771,8 +800,7 @@ with st.sidebar:
         st.checkbox("Uferlinie", key="shore")
         st.checkbox("Relief-Schummerung", key="hill_on")
         st.slider("Deckkraft Relief", 0.1, 1.0, step=0.05, key="hill_op", disabled=not S.hill_on)
-        st.checkbox("Abflusslose Senken (lila)", key="sinks_on", disabled=not SKIMAGE_OK,
-                    help="Becken ohne Abfluss zum Kartenrand – dort könnten sich Seen bilden.")
+        st.checkbox("Abflusslose Senken (lila)", key="sinks_on", disabled=not SKIMAGE_OK)
         st.slider("Mindesttiefe Senken (m)", 0.5, 50.0, step=0.5, key="sinks_min", disabled=not S.sinks_on)
         st.checkbox("Automatisch aktualisieren", key="auto")
         if not S.auto:
@@ -782,13 +810,11 @@ with st.sidebar:
         st.checkbox("Zweiter Wasserstand als rote Linie", key="l2_on")
         st.number_input("Zweiter Wasserstand (m)", LEVEL_MIN, LEVEL_MAX, step=10.0, key="level2",
                         disabled=not S.l2_on)
-        st.checkbox("Unsicherheitszone anzeigen (gelb)", key="band_on",
-                    help="Land, das innerhalb ± x m um den Wasserstand liegt.")
+        st.checkbox("Unsicherheitszone anzeigen (gelb)", key="band_on")
         st.slider("± Meter", 1.0, 200.0, step=1.0, key="band_m", disabled=not S.band_on)
 
     with st.expander("🧩 Eigene Kartenebenen"):
-        st.text_input("WMS-URL", key="wms_url", placeholder="https://…/wms?",
-                      help="z. B. geologische Karte eines Landesamts")
+        st.text_input("WMS-URL", key="wms_url", placeholder="https://…/wms?")
         st.text_input("WMS-Layername(n)", key="wms_layers")
         st.text_input("XYZ-URL", key="xyz_url", placeholder="https://…/{z}/{x}/{y}.png")
         st.slider("Deckkraft eigene Ebenen", 0.1, 1.0, step=0.05, key="ovl_op")
@@ -815,7 +841,7 @@ with st.sidebar:
 
 
 # =============================================================================
-# Hauptbereich – gemeinsame Berechnungen
+# Hauptbereich
 # =============================================================================
 st.markdown("""<div class="app-header"><h1>🌊 Flut-App</h1>
 <p>Meeresspiegel und Wasserstände weltweit simulieren – von −11 000 m bis +5000 m</p></div>""",
@@ -834,13 +860,10 @@ if S.flood_mode == FLOOD_MODES[2] and S.click:
 level2 = round(float(S.level2), 1) if S.l2_on else None
 band = float(S.band_m) if S.band_on else None
 
-tabs = st.tabs(["🗺️ Karte", "🏔️ 3D", "📈 Profil", "🏖️ Strandlinien", "🎬 Animation",
-                "📍 Markierungen", "📦 Export", "❓ Hilfe"])
-t_map, t_3d, t_prof, t_terr, t_anim, t_mark, t_exp, t_help = tabs
+t_map, t_3d, t_prof, t_terr, t_anim, t_mark, t_exp, t_help = st.tabs(
+    ["🗺️ Karte", "🏔️ 3D", "📈 Profil", "🏖️ Strandlinien", "🎬 Animation", "📍 Markierungen", "📦 Export", "❓ Hilfe"])
 
-# =============================================================================
-# Karte
-# =============================================================================
+# ---------------- Karte ----------------
 with t_map:
     fg = folium.FeatureGroup(name="Flut-Ebenen")
     info = None
@@ -853,9 +876,8 @@ with t_map:
             folium.raster_layers.ImageOverlay(to_uri(info["hill_png"]), bounds=box, opacity=float(S.hill_op),
                                               interactive=False, zindex=5).add_to(fg)
         if S.sinks_on and SKIMAGE_OK:
-            spng, _ = sinks_layer(tiles, float(S.sinks_min))
-            folium.raster_layers.ImageOverlay(to_uri(spng), bounds=box, opacity=1.0,
-                                              interactive=False, zindex=8).add_to(fg)
+            folium.raster_layers.ImageOverlay(to_uri(sinks_layer(tiles, float(S.sinks_min))), bounds=box,
+                                              opacity=1.0, interactive=False, zindex=8).add_to(fg)
         folium.raster_layers.ImageOverlay(to_uri(info["png"]), bounds=box, opacity=1.0,
                                           interactive=False, zindex=10).add_to(fg)
     except Exception as e:
@@ -890,14 +912,12 @@ with t_map:
         S.view = new_view
         if S.auto and choose_tiles(normalize_bounds(*new_view[:4]), new_view[4]) != tiles:
             need_rerun = True
-
     drw = (out or {}).get("all_drawings") or []
     lines = [f for f in drw if f and (f.get("geometry") or {}).get("type") == "LineString"]
     if lines:
         coords = [[round(float(a), 5), round(float(b), 5)] for a, b in lines[-1]["geometry"]["coordinates"]]
         if len(coords) >= 2 and coords != S.drawn_line:
             S.drawn_line = coords
-
     lc = (out or {}).get("last_clicked")
     if S.click_on and lc and lc.get("lat") is not None:
         key = (round(lc["lat"], 5), round(lc["lng"], 5))
@@ -905,13 +925,11 @@ with t_map:
             zc = min(MAX_TILE_ZOOM, (S.view[4] if S.view else S.zoom) + 2)
             S.click = dict(lat=key[0], lon=key[1], elev=elevation_at(key[0], key[1], zc))
             need_rerun = True
-
     if need_rerun and S._rr < 3:
         S._rr += 1
         st.rerun()
     S._rr = 0
 
-    # --- Legende ---
     leg = ("<span style='background:#7cc8f8'></span>flach<span style='background:#1f78d1'></span>mittel"
            "<span style='background:#08306b'></span>tief") if S.mode == MODES[0] else \
           ("<span style='background:#1e78dc'></span>neu überflutet<span style='background:#e0aa46'></span>"
@@ -925,11 +943,9 @@ with t_map:
         leg += "<span style='background:#963cc8'></span>abflusslose Senke"
     st.markdown(f"<div class='legend'>{leg}</div>", unsafe_allow_html=True)
 
-    # --- Kennzahlen ---
     if info:
         stt = info["stats"]
-        lat_c = (bounds[0] + bounds[2]) / 2
-        res_m = pixel_size_m(tiles[0]) * math.cos(math.radians(lat_c))
+        res_m = pixel_size_m(tiles[0]) * math.cos(math.radians((bounds[0] + bounds[2]) / 2))
         r1 = st.columns(4)
         r1[0].metric("Wasserstand", f"{de_num(S.level, sign=True)} m")
         r1[1].metric("Wasserfläche im Ausschnitt", f"{de_num(stt['water'], 0)} km²")
@@ -938,16 +954,14 @@ with t_map:
         r2 = st.columns(4)
         r2[0].metric("Wasservolumen im Ausschnitt", f"{de_num(stt['volume'], 1)} km³")
         r2[1].metric("Getrennte Wasserflächen", f"{stt['bodies']:,}".replace(",", "."))
-        r2[2].metric("Inseln", f"{stt['islands']:,}".replace(",", "."),
-                     f"{de_num(stt['isl_area'], 0)} km²", delta_color="off")
-        r2[3].metric("Auflösung Höhendaten", f"≈ {de_num(res_m, 0)} m", f"Kachelzoom {tiles[0]}",
+        r2[2].metric("Inseln", f"{stt['islands']:,}".replace(",", "."), f"{de_num(stt['isl_area'], 0)} km²",
                      delta_color="off")
+        r2[3].metric("Auflösung Höhendaten", f"≈ {de_num(res_m, 0)} m", f"Kachelzoom {tiles[0]}", delta_color="off")
         if info["missing"]:
             st.warning(f"{info['missing']} Höhenkachel(n) fehlen – dort ist kein Wasser dargestellt.")
         if S.flood_mode == FLOOD_MODES[2] and not S.click:
             st.info("Modus „Ab Startpunkt“: Klicke auf die Karte, um den Startpunkt zu setzen.")
 
-    # --- Klick-Abfrage ---
     if S.click:
         c = S.click
         st.markdown("#### 📍 Abfragepunkt")
@@ -972,12 +986,9 @@ with t_map:
                             k[3].metric("Überlaufhöhe", f"{de_num(spill, 1, True)} m",
                                         f"Becken bis {de_num(spill - c['elev'], 1)} m tief", delta_color="off")
                         else:
-                            k[3].metric("Überlaufhöhe", "kein Becken", "Wasser fließt zum Rand ab",
-                                        delta_color="off")
+                            k[3].metric("Überlaufhöhe", "kein Becken", "fließt zum Rand ab", delta_color="off")
                 except Exception:
                     pass
-        st.caption("Überlaufhöhe: bis zu diesem Wasserstand kann hier ein abgeschlossener See stehen, darüber "
-                   "läuft er zum Rand des Ausschnitts über. Hängt vom gewählten Kartenausschnitt ab.")
         with st.form("marker_form", clear_on_submit=True):
             mc1, mc2 = st.columns([1, 2])
             mname = mc1.text_input("Name der Markierung", value=f"Punkt {len(S.markers) + 1}")
@@ -989,7 +1000,7 @@ with t_map:
                 st.rerun()
     else:
         st.caption("💡 Klick auf die Karte = Höhe, Wassertiefe und Überlaufhöhe. Werkzeuge oben links: "
-                   "Vollbild, Messen, Linie zeichnen (für das Profil). Ebenen-Symbol oben rechts = Hintergrund.")
+                   "Vollbild, Messen, Linie zeichnen (Profil). Ebenen-Symbol oben rechts = Hintergrund.")
 
     with st.expander("💧 Wasserbilanz – wie viel Wasser bräuchte dieser Meeresspiegel?"):
         dv = OCEAN_AREA_KM2 * S.level / 1000.0
@@ -997,27 +1008,23 @@ with t_map:
         w1.metric("Volumenänderung weltweit (grob)", f"{de_num(dv / 1e6, 1, True)} Mio. km³")
         w2.metric("Anteil am heutigen Ozeanvolumen", f"{de_num(dv / OCEAN_VOL_KM3 * 100, 2, True)} %")
         w3.metric("Vielfaches allen Eises", f"{de_num(S.level / ICE_SLE_M, 1, True)} ×")
-        st.caption(f"Überschlag: Ozeanfläche ({de_num(OCEAN_AREA_KM2 / 1e6, 0)} Mio. km²) × Wasserstand. "
-                   f"Alles Eis der Erde entspricht ca. 65–70 m Meeresspiegel. Vernachlässigt: überflutete "
-                   "Landflächen, Absenkung/Hebung des Untergrunds, Wärmeausdehnung. Nur Größenordnung.")
+        st.caption("Überschlag: Ozeanfläche × Wasserstand. Alles Eis der Erde ≈ 65–70 m Meeresspiegel. "
+                   "Vernachlässigt: überflutete Landflächen, Hebung/Senkung, Wärmeausdehnung. Nur Größenordnung.")
 
     with st.expander("📈 Flutkurve für den sichtbaren Ausschnitt"):
         try:
             fc = flood_curve(tiles)
             if len(fc):
                 f = go.Figure(go.Scatter(x=fc.wasserstand_m, y=fc.flaeche_km2, mode="lines",
-                                         line=dict(color="#1f6fb2"), name="Fläche"))
+                                         line=dict(color="#1f6fb2")))
                 f.add_vline(x=S.level, line_dash="dash", line_color="gray")
                 f.update_layout(height=340, margin=dict(t=20, b=10), xaxis_title="Wasserstand (m)",
                                 yaxis_title="Überflutete Fläche (km²)")
                 st.plotly_chart(f, use_container_width=True)
-                st.caption("Steile Stufen = Höhen, ab denen große Ebenen oder Becken volllaufen (Badewanne).")
         except Exception as e:
             st.warning(f"Flutkurve nicht verfügbar: {e}")
 
-# =============================================================================
-# 3D
-# =============================================================================
+# ---------------- 3D ----------------
 with t_3d:
     if not PYDECK_OK:
         st.error("Für die 3D-Ansicht wird 'pydeck' benötigt.")
@@ -1025,45 +1032,47 @@ with t_3d:
         c1, c2, c3, c4, c5 = st.columns(5)
         tex = c1.selectbox("Oberfläche", list(TEXTURES_3D), key="tex3d")
         wmode = c2.selectbox("Wasser in 3D", WATER3D_MODES, key="water3d_mode",
-                             help="Wie Karte: gleicher Ausschnitt, gleiche Höhendaten und gleicher Flutungsmodus "
+                             help="Wie Karte: gleicher Ausschnitt, gleiche Höhendaten, gleicher Flutungsmodus "
                                   "wie die 2D-Karte. Einfache Ebene: flache Fläche, immer Badewanne.")
         exag = c3.slider("Überhöhung", 1.0, 20.0, step=0.5, key="exag3d")
         pitch = c4.slider("Neigung (°)", 0, 85, key="pitch3d")
         bearing = c5.slider("Drehung (°)", -180, 180, step=5, key="bearing3d")
         v = S.view or approx_view(S.center, S.zoom)
-        water3d, n_wet3d = None, None
+        water_polys, n_wet3d = None, None
         if wmode == WATER3D_MODES[0]:
-            try:
-                e_uri, t_uri, b3, n_wet3d = water_surface_3d(tiles, lvl, S.flood_mode, seed_rc,
-                                                             round(float(S.alpha), 2))
-                water3d = (e_uri, t_uri, b3)
-            except Exception as e:
-                st.warning(f"3D-Wasser wie Karte nicht möglich, verwende einfache Ebene: {e}")
-        deck = build_deck((v[0] + v[2]) / 2, (v[1] + v[3]) / 2, max(v[4] - 0.5, 1.0), float(S.level),
-                          float(exag), float(S.alpha) * 0.85, tex, int(pitch), int(bearing), water3d)
+            if not SKIMAGE_OK:
+                st.warning("Für „Wie Karte“ wird 'scikit-image' benötigt – verwende einfache Ebene.")
+            else:
+                try:
+                    water_polys, n_wet3d = water_polygons_3d(tiles, lvl, S.flood_mode, seed_rc)
+                except Exception as e:
+                    st.warning(f"3D-Wasser wie Karte nicht möglich, verwende einfache Ebene: {e}")
+                    water_polys = None
         try:
-            st.pydeck_chart(deck, use_container_width=True, height=MAP_HEIGHT)
-        except TypeError:
-            st.pydeck_chart(deck, use_container_width=True)
-        if water3d:
+            deck = build_deck((v[0] + v[2]) / 2, (v[1] + v[3]) / 2, max(v[4] - 0.5, 1.0), float(S.level),
+                              float(exag), float(S.alpha) * 0.85, tex, int(pitch), int(bearing), water_polys)
+            try:
+                st.pydeck_chart(deck, use_container_width=True, height=MAP_HEIGHT)
+            except TypeError:
+                st.pydeck_chart(deck, use_container_width=True)
+        except Exception as e:
+            st.error(f"3D-Ansicht konnte nicht erzeugt werden: {e}")
+        if water_polys is not None:
             if n_wet3d == 0:
                 st.info("Im aktuellen Ausschnitt steht bei diesem Wasserstand und Modus kein Wasser.")
             st.caption("🖱️ Mausrad = Zoom · Linke Maustaste = Verschieben · Rechte Maustaste (oder Strg + links) = "
                        f"Kippen/Drehen. Wasser bei {de_num(S.level, sign=True)} m aus denselben Daten wie die "
                        f"2D-Karte (Modus: {S.flood_mode.split(' (')[0]}). Wasser gibt es nur im Ausschnitt der "
-                       "2D-Karte – zum Verschieben des Gebiets die 2D-Karte bewegen.")
+                       "2D-Karte – zum Verschieben die 2D-Karte bewegen.")
         else:
-            st.caption("🖱️ Mausrad = Zoom · Linke Maustaste = Verschieben · Rechte Maustaste (oder Strg + links) = "
-                       f"Kippen/Drehen. Einfache Wasserebene bei {de_num(S.level, sign=True)} m (immer Badewanne).")
+            st.caption("🖱️ Mausrad = Zoom · Linke Maustaste = Verschieben · Rechte Maustaste = Kippen/Drehen. "
+                       f"Einfache Wasserebene bei {de_num(S.level, sign=True)} m (immer Badewanne).")
 
-# =============================================================================
-# Profil
-# =============================================================================
+# ---------------- Profil ----------------
 with t_prof:
     if not S.drawn_line:
-        st.info("So geht's: In der Karte oben links das **Linien-Werkzeug** wählen, Punkte setzen und mit "
-                "Klick auf den letzten Punkt (oder „Finish“) beenden. Tipp: vorher in der Sidebar "
-                "„Klick-Abfrage aktiv“ ausschalten.")
+        st.info("In der Karte oben links das **Linien-Werkzeug** wählen, Punkte setzen und mit Klick auf den "
+                "letzten Punkt beenden. Tipp: vorher „Klick-Abfrage aktiv“ ausschalten.")
     else:
         try:
             res = sample_profile(tuple(tuple(p) for p in S.drawn_line))
@@ -1093,26 +1102,22 @@ with t_prof:
             fig.update_layout(height=460, margin=dict(t=30, b=10), xaxis_title="Distanz (km)",
                               yaxis_title="Höhe (m)", legend=dict(orientation="h", y=1.08))
             st.plotly_chart(fig, use_container_width=True)
-            wet = e < S.level
             p = st.columns(4)
             p[0].metric("Länge", f"{de_num(dist[-1], 2)} km")
             p[1].metric("Tiefster Punkt", f"{de_num(np.nanmin(e), 1, True)} m")
             p[2].metric("Höchster Punkt", f"{de_num(np.nanmax(e), 1, True)} m")
-            p[3].metric("Anteil unter Wasser", f"{de_num(wet.mean() * 100, 0)} %")
-            st.caption(f"Höhendaten mit Kachelzoom {zp}. Profil über Badewanne – ohne Flutungsmodus.")
+            p[3].metric("Anteil unter Wasser", f"{de_num((e < S.level).mean() * 100, 0)} %")
+            st.caption(f"Höhendaten mit Kachelzoom {zp}. Profil als Badewanne – ohne Flutungsmodus.")
             b1, b2 = st.columns(2)
             b1.download_button("⬇️ Profil als CSV", df.to_csv(index=False).encode("utf-8"), "profil.csv", "text/csv")
             if b2.button("🗑️ Linie verwerfen"):
                 S.drawn_line = None
                 st.rerun()
 
-# =============================================================================
-# Strandlinien
-# =============================================================================
+# ---------------- Strandlinien ----------------
 with t_terr:
-    st.caption("Stand Wasser lange auf einer Höhe, entstehen oft Terrassen und Kanten – alle auf **derselben "
-               "Höhe**. Hier wird pro Höhenstufe gezählt, wie oft Hangknicke im Ausschnitt vorkommen "
-               "(1,0 = Durchschnitt). Mit „Gebiet merken“ kannst du mehrere Regionen vergleichen.")
+    st.caption("Pro Höhenstufe wird gezählt, wie oft Hangknicke im Ausschnitt vorkommen (1,0 = Durchschnitt). "
+               "Mit „Gebiet merken“ kannst du mehrere Regionen vergleichen.")
     c1, c2, c3 = st.columns([1, 1, 2])
     bin_m = c1.number_input("Höhenschritt (m)", 0.5, 200.0, 5.0, 0.5, key="terr_bin")
     if c2.button("🔍 Ausschnitt analysieren", type="primary"):
@@ -1127,8 +1132,8 @@ with t_terr:
         fig = go.Figure()
         fig.add_trace(go.Bar(x=cur.hoehe_m, y=cur.kantendichte, name="Aktueller Ausschnitt",
                              marker_color="darkorange", opacity=0.75))
-        for name, d in S.areas.items():
-            dd = pd.DataFrame(d)
+        for name, dd in S.areas.items():
+            dd = pd.DataFrame(dd)
             fig.add_trace(go.Scatter(x=dd.hoehe_m, y=dd.kantendichte, mode="lines", name=name))
         fig.add_hline(y=1.0, line_dash="dot", line_color="gray")
         fig.add_vline(x=S.level, line_dash="dash", line_color="#1f6fb2")
@@ -1150,58 +1155,46 @@ with t_terr:
                     S.areas.pop(n, None)
                 st.rerun()
         st.caption("⚠️ Nur ein Hinweis: Auch Ackerterrassen, Straßen oder Gesteinsschichten erzeugen Kanten auf "
-                   "gleicher Höhe. Aussagekräftig wird es, wenn dieselbe Höhe in **mehreren, weit entfernten "
-                   "Gebieten** auftaucht. Grobe Höhendaten (große Ausschnitte) verwischen feine Terrassen.")
+                   "gleicher Höhe. Aussagekräftig wird es, wenn dieselbe Höhe in mehreren, weit entfernten "
+                   "Gebieten auftaucht.")
 
-# =============================================================================
-# Animation
-# =============================================================================
+# ---------------- Animation ----------------
 with t_anim:
     a1, a2, a3, a4 = st.columns(4)
-    lo = a1.number_input("Von (m)", LEVEL_MIN, LEVEL_MAX, float(max(LEVEL_MIN, S.level - 100)), 10.0, key="anim_lo")
-    hi = a2.number_input("Bis (m)", LEVEL_MIN, LEVEL_MAX, float(min(LEVEL_MAX, S.level + 100)), 10.0, key="anim_hi")
-    steps = a3.slider("Bilder", 6, 40, 16, key="anim_steps")
-    speed = a4.select_slider("Tempo", ["langsam", "mittel", "schnell"], value="mittel", key="anim_speed")
-    b1, b2 = st.columns(2)
-    basemap = b1.selectbox("Hintergrund", list(BASEMAPS_ANIM), key="anim_base")
-    hill_mix = b2.slider("Relief darüberlegen", 0.0, 1.0, step=0.05, key="anim_hill",
-                         disabled=basemap == "Nur Relief",
-                         help="0 = reine Karte · 1 = Karte stark plastisch schattiert")
-    dur = {"langsam": 700, "mittel": 400, "schnell": 200}[speed]
+    a1.number_input("Von (m)", LEVEL_MIN, LEVEL_MAX, step=10.0, key="anim_lo")
+    a2.number_input("Bis (m)", LEVEL_MIN, LEVEL_MAX, step=10.0, key="anim_hi")
+    a3.slider("Bilder", 6, 40, key="anim_steps")
+    a4.select_slider("Tempo", list(ANIM_SPEEDS), key="anim_speed")
+    b1, b2, b3 = st.columns([2, 2, 1])
+    b1.selectbox("Hintergrund", list(BASEMAPS_ANIM), key="anim_base")
+    b2.slider("Relief darüberlegen", 0.0, 1.0, step=0.05, key="anim_hill", disabled=S.anim_base == "Nur Relief")
+    b3.write("")
+    b3.button("± 100 m um aktuellen Stand", on_click=anim_around, use_container_width=True)
+    dur = ANIM_SPEEDS[S.anim_speed]
+    spec = (tiles, float(S.anim_lo), float(S.anim_hi), int(S.anim_steps), S.flood_mode, seed_rc,
+            round(float(S.alpha), 2), dur, S.anim_base, float(S.anim_hill), S.mode, bool(S.shore))
     if st.button("🎬 Animation für den aktuellen Ausschnitt erzeugen", type="primary"):
-        if hi <= lo:
+        if S.anim_hi <= S.anim_lo:
             st.warning("„Bis“ muss größer sein als „Von“.")
         else:
-            frames, gif = make_animation(tiles, float(lo), float(hi), int(steps), S.flood_mode, seed_rc,
-                                         float(S.alpha), dur, basemap, float(hill_mix))
-            S.anim = dict(frames=frames, gif=gif)
-            S.anim_idx = 0
+            frames, gif = make_animation(*spec)
+            S.anim = dict(frames=frames, gif=gif, spec=spec)
     if S.anim:
-        g1, g2 = st.columns(2)
-        with g1:
-            st.markdown("**▶ Film (läuft automatisch)**")
-            st.image(S.anim["gif"], use_container_width=True)
-            st.download_button("⬇️ GIF herunterladen", S.anim["gif"], "flutung.gif", "image/gif")
-        with g2:
-            st.markdown("**⏸ Bild für Bild (angehalten)**")
-            n = len(S.anim["frames"])
-            if S.get("anim_idx", 0) > n - 1:
-                S.anim_idx = 0
-            i = st.slider("Bild", 0, n - 1, key="anim_idx",
-                          help="Schieberegler bewegen = vor- und zurückspulen")
-            lv_i, png_i = S.anim["frames"][min(i, n - 1)]
-            st.image(png_i, caption=f"Wasserstand {de_num(lv_i, 0, True)} m", use_container_width=True)
-            st.button("Diesen Wasserstand übernehmen", on_click=set_level, args=(lv_i,))
-        st.caption("Die Animation zeigt den aktuellen Kartenausschnitt mit dem Flutungsmodus aus der Sidebar. "
-                   "Nach Änderung von Hintergrund oder Ausschnitt bitte neu erzeugen.")
+        if S.anim["spec"] != spec:
+            st.info("Einstellungen oder Ausschnitt wurden geändert – für eine aktuelle Animation neu erzeugen.")
+        anim_player(S.anim["frames"], S.anim["spec"][7])
+        c1, c2, c3 = st.columns([2, 1, 1])
+        levels = [round(lv, 1) for lv, _ in S.anim["frames"]]
+        pick = c1.select_slider("Wasserstand aus der Animation übernehmen", options=levels, key="anim_pick")
+        c2.button("✔ Übernehmen", on_click=set_level, args=(float(pick),), use_container_width=True)
+        c3.download_button("⬇️ GIF", S.anim["gif"], "flutung.gif", "image/gif", use_container_width=True)
+        st.caption("Gleiche Farben, Uferlinie und Flutungsmodus wie die 2D-Karte. ▶/⏸ startet und hält an, "
+                   "⏮ ⏭ und der Schieberegler gehen Bild für Bild.")
 
-# =============================================================================
-# Markierungen
-# =============================================================================
+# ---------------- Markierungen ----------------
 with t_mark:
     if S.markers:
-        mdf = pd.DataFrame(S.markers)
-        st.dataframe(mdf, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(S.markers), use_container_width=True, hide_index=True)
         dsel = st.multiselect("Markierungen löschen", [m["name"] for m in S.markers])
         c1, c2 = st.columns(2)
         if dsel and c1.button("🗑️ Ausgewählte löschen"):
@@ -1225,16 +1218,13 @@ with t_mark:
         except Exception as e:
             st.error(f"Datei konnte nicht gelesen werden: {e}")
 
-# =============================================================================
-# Export
-# =============================================================================
+# ---------------- Export ----------------
 with t_exp:
     e1, e2, e3 = st.columns(3)
     with e1:
         st.markdown("**🗺️ Karte**")
         if info:
-            st.download_button("⬇️ Wasserbild (PNG, transparent)", info["png"],
-                               f"wasser_{lvl:+.0f}m.png", "image/png")
+            st.download_button("⬇️ Wasserbild (PNG, transparent)", info["png"], f"wasser_{lvl:+.0f}m.png", "image/png")
             b = info["bounds"]
             st.caption(f"Ausdehnung (S, W, N, O): {b[0]:.4f}, {b[1]:.4f}, {b[2]:.4f}, {b[3]:.4f} · Web-Mercator")
         try:
@@ -1261,9 +1251,8 @@ with t_exp:
     with e3:
         st.markdown("**🔗 Teilen & Sichern**")
         v = S.view or approx_view(S.center, S.zoom)
-        params = dict(lat=f"{(v[0] + v[2]) / 2:.4f}", lon=f"{(v[1] + v[3]) / 2:.4f}", zoom=str(v[4]),
-                      level=f"{S.level:.1f}")
-        st.code("?" + "&".join(f"{k}={val}" for k, val in params.items()), language=None)
+        st.code(f"?lat={(v[0] + v[2]) / 2:.4f}&lon={(v[1] + v[3]) / 2:.4f}&zoom={v[4]}&level={S.level:.1f}",
+                language=None)
         st.caption("Die Adresszeile des Browsers enthält diese Werte – einfach kopieren und verschicken.")
         cfg = {k: S[k] for k in ("level", "mode", "flood_mode", "alpha", "shore", "hill_on", "band_on", "band_m",
                                  "l2_on", "level2", "sinks_on", "sinks_min")}
@@ -1271,47 +1260,31 @@ with t_exp:
         st.download_button("⬇️ Einstellungen (JSON)", json.dumps(cfg, ensure_ascii=False, indent=1).encode(),
                            "flut_einstellungen.json", "application/json")
 
-# =============================================================================
-# Hilfe
-# =============================================================================
+# ---------------- Hilfe ----------------
 with t_help:
     st.markdown("""
 ### Kurzanleitung
-1. **Wasserstand** in der Sidebar einstellen (Regler, Zahl oder ±-Knöpfe). Minuswerte zeigen tiefere Meeresspiegel.
+1. **Wasserstand** in der Sidebar einstellen (Regler, Zahl, ±-Knöpfe). Minuswerte = tieferer Meeresspiegel.
 2. **Karte** verschieben und zoomen – das Wasser wird für den sichtbaren Ausschnitt berechnet.
-3. **Flutungsmodus** wählen: Badewanne, vom Kartenrand oder ab einem angeklickten Startpunkt.
-4. **Klick** auf die Karte: Höhe, Wassertiefe, Überlaufhöhe – und als Markierung speichern.
-5. **3D:** Wasser „Wie Karte“ zeigt dasselbe Wasser wie die 2D-Karte, plastisch und kippbar.
-6. **Profil:** Linien-Werkzeug oben links in der Karte, dann Reiter „📈 Profil“.
-7. **Strandlinien:** Ausschnitt analysieren, Gebiet merken, an anderem Ort wiederholen und vergleichen.
-8. **Animation:** Bereich und Hintergrund wählen, erzeugen, als Film ansehen oder Bild für Bild durchgehen.
+3. **Flutungsmodus**: Badewanne, vom Kartenrand oder ab angeklicktem Startpunkt.
+4. **Klick** auf die Karte: Höhe, Wassertiefe, Überlaufhöhe – als Markierung speicherbar.
+5. **3D**: „Wie Karte“ zeigt dasselbe Wasser wie die 2D-Karte, kipp- und drehbar.
+6. **Profil**: Linien-Werkzeug oben links in der Karte, dann Reiter „📈 Profil“.
+7. **Strandlinien**: Ausschnitt analysieren, Gebiet merken, an anderem Ort wiederholen.
+8. **Animation**: Bereich wählen, erzeugen, mit ▶/⏸ abspielen oder Bild für Bild durchgehen.
 
-### Kartenwerkzeuge (oben links)
-⛶ Vollbild · 📏 Messen (Strecken/Flächen) · ✏️ Linie zeichnen · 🗑️ Linie löschen · unten links Koordinaten.
-
-### Tipps
-- Kleine Ausschnitte = feinere Höhendaten. Für Täler und Terrassen hineinzoomen.
-- „Veränderung zu heute“ + Minuswert zeigt trockengefallenen Meeresboden in Ocker.
-- Bei langsamer Reaktion „Automatisch aktualisieren“ ausschalten und per Knopf rechnen.
-""")
-    with st.expander("ℹ️ Grenzen des Modells & Datenquellen", expanded=True):
-        st.markdown("""
-- **Badewannen-Modell:** keine Strömung, keine Zeit. Im Modus Badewanne werden auch Senken ohne Meeresverbindung
-  blau (z. B. Kaspisches Becken, Totes Meer).
-- **„Vom Kartenrand“ und Überlaufhöhe** beziehen sich auf den **sichtbaren Ausschnitt** – ein anderer Ausschnitt
-  kann andere Ergebnisse liefern.
-- **3D:** Das Gelände in 3D wird je nach Zoom vereinfacht. Das Wasser („Wie Karte“) stammt aus denselben Daten wie
-  die 2D-Karte; an sehr flachen Ufern kann der Übergang trotzdem leicht abweichen.
-- **Einheitlicher Wasserstand:** Frühere Meeresspiegel waren regional unterschiedlich (Hebung/Senkung durch Eislast).
-  Das heutige Gelände ist nicht das damalige (Erosion, Ablagerung, Bebauung).
+### Grenzen des Modells & Datenquellen
+- **Badewannen-Modell:** keine Strömung, keine Zeit. Im Modus Badewanne werden auch Senken ohne Meeresverbindung blau.
+- **„Vom Kartenrand“ und Überlaufhöhe** beziehen sich auf den sichtbaren Ausschnitt.
+- **Einheitlicher Wasserstand:** Frühere Meeresspiegel waren regional unterschiedlich (Hebung/Senkung durch Eislast);
+  das heutige Gelände ist nicht das damalige.
 - **Höhendaten:** AWS Terrain Tiles (Mapzen; u. a. SRTM an Land, ETOPO/GEBCO im Meer). An Land bei starkem Zoom ca.
-  30 m Auflösung, Fehler von mehreren Metern möglich. **Meeresboden deutlich gröber.** Bezug ≈ heutiger Meeresspiegel.
-- **Wasserbilanz:** grobe Überschlagsrechnung, nur Größenordnung.
+  30 m Auflösung, Fehler von mehreren Metern möglich. Meeresboden deutlich gröber. Bezug ≈ heutiger Meeresspiegel.
+- **3D:** Das Gelände wird je nach Zoom vereinfacht; an sehr flachen Ufern kann das Wasser leicht abweichen.
 - **Karten:** © OpenStreetMap-Mitwirkende · Esri World Imagery · OpenTopoMap · Ortssuche: Nominatim (OSM).
-- Seehöhen der Beispielorte sind gerundet – für genaue Werte Fachliteratur nutzen.
+- Seehöhen der Beispielorte sind gerundet.
 """)
 
-# --- Link in der Adresszeile aktuell halten -------------------------------------------
 try:
     _v = S.view or approx_view(S.center, S.zoom)
     st.query_params["lat"] = f"{(_v[0] + _v[2]) / 2:.4f}"
