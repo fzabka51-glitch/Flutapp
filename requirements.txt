@@ -1,1 +1,13 @@
+streamlit>=1.35
+streamlit-folium>=0.22
+folium>=0.17
+pydeck
+plotly>=5.18
+pandas
+numpy
+scipy
+scikit-image
+matplotlib>=3.6
+requests
+Pillow
 
