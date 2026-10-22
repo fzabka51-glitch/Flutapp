@@ -1,9 +1,10 @@
 # =============================================================================
-# app.py – Flut-App 0.4 · Weltweite Meeresspiegel- und Flutungssimulation
+# app.py – Flut-App 0.5 · Weltweite Meeresspiegel- und Flutungssimulation
 # Eine Datei. Badewannen-Modell auf Basis der AWS Terrain Tiles (inkl. Meeresboden).
 # Werkzeuge: Flutungsmodi, Überlaufhöhe, Senken, Profil, Strandlinien-Vergleich,
 # Animation (mit Kartenhintergrund), Markierungen, Overlays, 3D, Export, Link teilen.
 # Neu in 0.4: Header-Korrektur, Animation mit Satellit/OSM/Gelände-Hintergrund.
+# Neu in 0.5: 3D-Wasser aus denselben Daten wie die 2D-Karte (gleicher Modus/Ausschnitt).
 # =============================================================================
 from __future__ import annotations
 
@@ -43,7 +44,7 @@ st.set_page_config(page_title="Flut-App", page_icon="🌊", layout="wide")
 # =============================================================================
 # Konstanten
 # =============================================================================
-APP_VERSION = "0.4"
+APP_VERSION = "0.5"
 LEVEL_MIN, LEVEL_MAX = -11000.0, 5000.0
 DEFAULT_CENTER = [50.0, 8.0]
 DEFAULT_ZOOM = 5
@@ -69,6 +70,7 @@ MODES = ["Wassertiefe", "Veränderung zu heute"]
 FLOOD_MODES = ["Badewanne (alles unter dem Wasserstand)",
                "Zusammenhängend vom Kartenrand",
                "Ab Startpunkt (letzter Klick)"]
+WATER3D_MODES = ["Wie Karte (genau)", "Einfache Ebene"]
 WATER_CMAP = LinearSegmentedColormap.from_list("wasser", ["#7cc8f8", "#1f78d1", "#08306b"])
 COL_NEW = (30, 120, 220)
 COL_DRY = (224, 170, 70)
@@ -108,7 +110,7 @@ for _k, _v in dict(
         hill_on=False, hill_op=0.45, band_on=False, band_m=10.0, l2_on=False, level2=100.0,
         sinks_on=False, sinks_min=2.0, wms_url="", wms_layers="", xyz_url="", ovl_op=0.6,
         markers=[], drawn_line=None, areas={}, anim=None, terr=None,
-        tex3d=list(TEXTURES_3D)[0], exag3d=3.0, pitch3d=55, bearing3d=0,
+        tex3d=list(TEXTURES_3D)[0], exag3d=3.0, pitch3d=55, bearing3d=0, water3d_mode=WATER3D_MODES[0],
         anim_base=list(BASEMAPS_ANIM)[0], anim_hill=0.4).items():
     if _k not in S:
         S[_k] = _v.copy() if isinstance(_v, (list, dict)) else _v
@@ -589,7 +591,41 @@ def make_animation(tiles, lo, hi, steps, flood_mode, seed_rc, alpha, duration_ms
 
 
 # --- 3D ------------------------------------------------------------------------------
-def build_deck(lat, lon, zoom, level, exag, alpha, texture, pitch, bearing):
+def _linear_lat_rows(arr, tiles, rows):
+    """Zeilen von Web-Mercator auf gleichmäßige Breitengrade umrechnen (für das 3D-Bild)."""
+    z, _, ty0, _, ty1 = tiles
+    lat = tile_to_lonlat(0.0, ty0 + (rows + 0.5) / TILE, z)[1]
+    north = float(tile_to_lonlat(0.0, ty0, z)[1])
+    south = float(tile_to_lonlat(0.0, ty1 + 1, z)[1])
+    n = len(rows)
+    target = north - (np.arange(n) + 0.5) * (north - south) / n
+    idx = np.interp(target, lat[::-1], np.arange(n)[::-1])
+    return arr[np.clip(np.round(idx).astype(int), 0, n - 1)]
+
+
+@st.cache_data(show_spinner="Bereite 3D-Wasser vor …", max_entries=6)
+def water_surface_3d(tiles, level, flood_mode, seed_rc, alpha, max_dim=1024):
+    """Wasseroberfläche aus denselben Daten wie die 2D-Karte (gleicher Modus, gleiche Kacheln)."""
+    dem, bounds, _ = load_mosaic(*tiles)
+    water = compute_water(dem, level, flood_mode, seed_rc)
+    rgba = water_rgba(dem, water, level, alpha)
+    fill = float(np.nanmin(dem)) if np.isfinite(dem).any() else 0.0
+    d = np.where(np.isfinite(dem), dem, fill)
+    surf = np.where(water, level, d - 1.0)          # trocken: knapp unter dem Gelände und transparent
+    s = max(1, math.ceil(max(dem.shape) / max_dim))
+    rows = np.arange(0, dem.shape[0], s)
+    surf = _linear_lat_rows(surf[::s, ::s], tiles, rows)
+    rgba = _linear_lat_rows(rgba[::s, ::s], tiles, rows)
+    v = np.clip(surf + 32768.0, 0, 65535.99)        # Terrarium-Kodierung
+    r = np.floor(v / 256.0)
+    g = np.floor(v) - r * 256.0
+    b = np.floor((v - np.floor(v)) * 256.0)
+    elev = np.dstack([r, g, b]).astype(np.uint8)
+    return to_uri(to_png_bytes(elev)), to_uri(to_png_bytes(rgba)), bounds, int(water.sum())
+
+
+def build_deck(lat, lon, zoom, level, exag, alpha, texture, pitch, bearing, water3d=None):
+    """3D-Gelände + Wasser. water3d = (Höhenbild, Wasserbild, Ausdehnung) oder None für einfache Ebene."""
     dec = {"rScaler": 256 * exag, "gScaler": 1 * exag, "bScaler": exag / 256, "offset": -32768 * exag}
     kw = dict(elevation_decoder=dec, elevation_data=TERRARIUM_URL, max_zoom=15,
               wireframe=False, pickable=False)
@@ -598,16 +634,24 @@ def build_deck(lat, lon, zoom, level, exag, alpha, texture, pitch, bearing):
         kw["texture"] = tex_url
     else:
         kw["color"] = [200, 190, 170]
-    terrain = pdk.Layer("TerrainLayer", **kw)
-    span = float(np.clip(360.0 / 2 ** zoom * 3, 0.5, 80.0))
-    h = level * exag
-    s, n = max(lat - span, -85.0), min(lat + span, 85.0)
-    w, e = lon - span * 2, lon + span * 2
-    water = pdk.Layer("PolygonLayer", data=[{"polygon": [[w, s, h], [e, s, h], [e, n, h], [w, n, h]]}],
-                      get_polygon="polygon", get_fill_color=[30, 120, 220, int(255 * alpha)],
-                      stroked=False, filled=True, extruded=False, pickable=False)
+    layers = [pdk.Layer("TerrainLayer", **kw)]
+
+    if water3d:
+        elev_uri, tex_uri, b = water3d              # b = (S, W, N, O)
+        layers.append(pdk.Layer("TerrainLayer", id="wasser3d", elevation_data=elev_uri, texture=tex_uri,
+                                bounds=[b[1], b[0], b[3], b[2]], elevation_decoder=dec,
+                                mesh_max_error=1.0, wireframe=False, pickable=False))
+    else:
+        span = float(np.clip(360.0 / 2 ** zoom * 3, 0.5, 80.0))
+        h = level * exag
+        s, n = max(lat - span, -85.0), min(lat + span, 85.0)
+        w, e = lon - span * 2, lon + span * 2
+        layers.append(pdk.Layer("PolygonLayer",
+                                data=[{"polygon": [[w, s, h], [e, s, h], [e, n, h], [w, n, h]]}],
+                                get_polygon="polygon", get_fill_color=[30, 120, 220, int(255 * alpha)],
+                                stroked=False, filled=True, extruded=False, pickable=False))
     view = pdk.ViewState(latitude=lat, longitude=lon, zoom=zoom, pitch=pitch, bearing=bearing, max_pitch=85)
-    return pdk.Deck(layers=[terrain, water], initial_view_state=view, map_style=None)
+    return pdk.Deck(layers=layers, initial_view_state=view, map_style=None)
 
 
 # =============================================================================
@@ -978,20 +1022,39 @@ with t_3d:
     if not PYDECK_OK:
         st.error("Für die 3D-Ansicht wird 'pydeck' benötigt.")
     else:
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         tex = c1.selectbox("Oberfläche", list(TEXTURES_3D), key="tex3d")
-        exag = c2.slider("Überhöhung", 1.0, 20.0, step=0.5, key="exag3d")
-        pitch = c3.slider("Neigung (°)", 0, 85, key="pitch3d")
-        bearing = c4.slider("Drehung (°)", -180, 180, step=5, key="bearing3d")
+        wmode = c2.selectbox("Wasser in 3D", WATER3D_MODES, key="water3d_mode",
+                             help="Wie Karte: gleicher Ausschnitt, gleiche Höhendaten und gleicher Flutungsmodus "
+                                  "wie die 2D-Karte. Einfache Ebene: flache Fläche, immer Badewanne.")
+        exag = c3.slider("Überhöhung", 1.0, 20.0, step=0.5, key="exag3d")
+        pitch = c4.slider("Neigung (°)", 0, 85, key="pitch3d")
+        bearing = c5.slider("Drehung (°)", -180, 180, step=5, key="bearing3d")
         v = S.view or approx_view(S.center, S.zoom)
+        water3d, n_wet3d = None, None
+        if wmode == WATER3D_MODES[0]:
+            try:
+                e_uri, t_uri, b3, n_wet3d = water_surface_3d(tiles, lvl, S.flood_mode, seed_rc,
+                                                             round(float(S.alpha), 2))
+                water3d = (e_uri, t_uri, b3)
+            except Exception as e:
+                st.warning(f"3D-Wasser wie Karte nicht möglich, verwende einfache Ebene: {e}")
         deck = build_deck((v[0] + v[2]) / 2, (v[1] + v[3]) / 2, max(v[4] - 0.5, 1.0), float(S.level),
-                          float(exag), float(S.alpha) * 0.85, tex, int(pitch), int(bearing))
+                          float(exag), float(S.alpha) * 0.85, tex, int(pitch), int(bearing), water3d)
         try:
             st.pydeck_chart(deck, use_container_width=True, height=MAP_HEIGHT)
         except TypeError:
             st.pydeck_chart(deck, use_container_width=True)
-        st.caption("🖱️ Mausrad = Zoom · Linke Maustaste = Verschieben · Rechte Maustaste (oder Strg + links) = "
-                   f"Kippen/Drehen. Wasserebene bei {de_num(S.level, sign=True)} m (Badewanne).")
+        if water3d:
+            if n_wet3d == 0:
+                st.info("Im aktuellen Ausschnitt steht bei diesem Wasserstand und Modus kein Wasser.")
+            st.caption("🖱️ Mausrad = Zoom · Linke Maustaste = Verschieben · Rechte Maustaste (oder Strg + links) = "
+                       f"Kippen/Drehen. Wasser bei {de_num(S.level, sign=True)} m aus denselben Daten wie die "
+                       f"2D-Karte (Modus: {S.flood_mode.split(' (')[0]}). Wasser gibt es nur im Ausschnitt der "
+                       "2D-Karte – zum Verschieben des Gebiets die 2D-Karte bewegen.")
+        else:
+            st.caption("🖱️ Mausrad = Zoom · Linke Maustaste = Verschieben · Rechte Maustaste (oder Strg + links) = "
+                       f"Kippen/Drehen. Einfache Wasserebene bei {de_num(S.level, sign=True)} m (immer Badewanne).")
 
 # =============================================================================
 # Profil
@@ -1218,9 +1281,10 @@ with t_help:
 2. **Karte** verschieben und zoomen – das Wasser wird für den sichtbaren Ausschnitt berechnet.
 3. **Flutungsmodus** wählen: Badewanne, vom Kartenrand oder ab einem angeklickten Startpunkt.
 4. **Klick** auf die Karte: Höhe, Wassertiefe, Überlaufhöhe – und als Markierung speichern.
-5. **Profil:** Linien-Werkzeug oben links in der Karte, dann Reiter „📈 Profil“.
-6. **Strandlinien:** Ausschnitt analysieren, Gebiet merken, an anderem Ort wiederholen und vergleichen.
-7. **Animation:** Bereich und Hintergrund wählen, erzeugen, als Film ansehen oder Bild für Bild durchgehen.
+5. **3D:** Wasser „Wie Karte“ zeigt dasselbe Wasser wie die 2D-Karte, plastisch und kippbar.
+6. **Profil:** Linien-Werkzeug oben links in der Karte, dann Reiter „📈 Profil“.
+7. **Strandlinien:** Ausschnitt analysieren, Gebiet merken, an anderem Ort wiederholen und vergleichen.
+8. **Animation:** Bereich und Hintergrund wählen, erzeugen, als Film ansehen oder Bild für Bild durchgehen.
 
 ### Kartenwerkzeuge (oben links)
 ⛶ Vollbild · 📏 Messen (Strecken/Flächen) · ✏️ Linie zeichnen · 🗑️ Linie löschen · unten links Koordinaten.
@@ -1236,6 +1300,8 @@ with t_help:
   blau (z. B. Kaspisches Becken, Totes Meer).
 - **„Vom Kartenrand“ und Überlaufhöhe** beziehen sich auf den **sichtbaren Ausschnitt** – ein anderer Ausschnitt
   kann andere Ergebnisse liefern.
+- **3D:** Das Gelände in 3D wird je nach Zoom vereinfacht. Das Wasser („Wie Karte“) stammt aus denselben Daten wie
+  die 2D-Karte; an sehr flachen Ufern kann der Übergang trotzdem leicht abweichen.
 - **Einheitlicher Wasserstand:** Frühere Meeresspiegel waren regional unterschiedlich (Hebung/Senkung durch Eislast).
   Das heutige Gelände ist nicht das damalige (Erosion, Ablagerung, Bebauung).
 - **Höhendaten:** AWS Terrain Tiles (Mapzen; u. a. SRTM an Land, ETOPO/GEBCO im Meer). An Land bei starkem Zoom ca.
