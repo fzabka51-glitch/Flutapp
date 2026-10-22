@@ -1,8 +1,9 @@
 # =============================================================================
-# app.py – Flut-App 0.3 · Weltweite Meeresspiegel- und Flutungssimulation
+# app.py – Flut-App 0.4 · Weltweite Meeresspiegel- und Flutungssimulation
 # Eine Datei. Badewannen-Modell auf Basis der AWS Terrain Tiles (inkl. Meeresboden).
 # Werkzeuge: Flutungsmodi, Überlaufhöhe, Senken, Profil, Strandlinien-Vergleich,
-# Animation, Markierungen, Overlays, 3D, Export, Link teilen.
+# Animation (mit Kartenhintergrund), Markierungen, Overlays, 3D, Export, Link teilen.
+# Neu in 0.4: Header-Korrektur, Animation mit Satellit/OSM/Gelände-Hintergrund.
 # =============================================================================
 from __future__ import annotations
 
@@ -42,7 +43,7 @@ st.set_page_config(page_title="Flut-App", page_icon="🌊", layout="wide")
 # =============================================================================
 # Konstanten
 # =============================================================================
-APP_VERSION = "0.3"
+APP_VERSION = "0.4"
 LEVEL_MIN, LEVEL_MAX = -11000.0, 5000.0
 DEFAULT_CENTER = [50.0, 8.0]
 DEFAULT_ZOOM = 5
@@ -51,6 +52,8 @@ USER_AGENT = "Flut-App (privates Projekt)"
 
 TERRARIUM_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 ESRI_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+OSM_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+TOPO_URL = "https://a.tile.opentopomap.org/{z}/{x}/{y}.png"
 MAX_TILE_ZOOM = 15
 TILE = 256
 EARTH_CIRC = 40075016.686
@@ -76,9 +79,15 @@ COL_BAND = (255, 235, 120)
 
 TEXTURES_3D = {
     "Satellit (Esri)": ESRI_URL,
-    "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    "Gelände (OpenTopoMap)": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+    "OpenStreetMap": OSM_URL,
+    "Gelände (OpenTopoMap)": TOPO_URL,
     "Ohne (nur Relief)": None,
+}
+BASEMAPS_ANIM = {
+    "Satellit (Esri)": (ESRI_URL, "© Esri World Imagery"),
+    "OpenStreetMap": (OSM_URL, "© OpenStreetMap-Mitwirkende"),
+    "Gelände (OpenTopoMap)": (TOPO_URL, "© OpenTopoMap, © OSM"),
+    "Nur Relief": (None, ""),
 }
 
 PRESETS = [("🌍 Heute", 0.0), ("🧊 Eiszeit −120 m", -120.0), ("🔥 Eis geschmolzen +70 m", 70.0)]
@@ -99,7 +108,8 @@ for _k, _v in dict(
         hill_on=False, hill_op=0.45, band_on=False, band_m=10.0, l2_on=False, level2=100.0,
         sinks_on=False, sinks_min=2.0, wms_url="", wms_layers="", xyz_url="", ovl_op=0.6,
         markers=[], drawn_line=None, areas={}, anim=None, terr=None,
-        tex3d=list(TEXTURES_3D)[0], exag3d=3.0, pitch3d=55, bearing3d=0).items():
+        tex3d=list(TEXTURES_3D)[0], exag3d=3.0, pitch3d=55, bearing3d=0,
+        anim_base=list(BASEMAPS_ANIM)[0], anim_hill=0.4).items():
     if _k not in S:
         S[_k] = _v.copy() if isinstance(_v, (list, dict)) else _v
 
@@ -120,11 +130,12 @@ if not S.get("_qp_done"):
 
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem; max-width: 1800px;}
+.block-container {padding-top: 3.2rem; max-width: 1800px;}
 .app-header {background: linear-gradient(135deg, #0b3d6b 0%, #1f6fb2 55%, #5fb0e5 100%);
   color: #fff; padding: 16px 24px; border-radius: 14px; margin-bottom: 14px;
   box-shadow: 0 4px 14px rgba(11, 61, 107, .25);}
-.app-header h1 {color: #fff !important; margin: 0; font-size: 1.8rem; padding: 0;}
+.app-header h1 {color: #fff !important; margin: 0 !important; padding: 2px 0 !important;
+  font-size: 1.8rem; line-height: 1.35 !important; overflow: visible;}
 .app-header p {margin: 4px 0 0; opacity: .92;}
 div[data-testid="stMetric"] {background: #fff; border: 1px solid #d6e4ef; border-radius: 12px;
   padding: 8px 14px; box-shadow: 0 1px 4px rgba(0, 0, 0, .05);}
@@ -506,16 +517,50 @@ def _font(size):
         return ImageFont.load_default()
 
 
+@st.cache_data(show_spinner=False, max_entries=800)
+def _fetch_base_tile(url, z, x, y):
+    r = _session.get(url.format(z=z, x=x, y=y), timeout=20)
+    r.raise_for_status()
+    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+    if img.size != (TILE, TILE):
+        img = img.resize((TILE, TILE))
+    return np.asarray(img, dtype=np.uint8)
+
+
+def base_mosaic(url, z, tx0, ty0, tx1, ty1):
+    """Kartenkacheln für exakt denselben Ausschnitt wie das Höhenmodell."""
+    n = 2 ** z
+    rows = []
+    for ty in range(ty0, ty1 + 1):
+        row = []
+        for tx in range(tx0, tx1 + 1):
+            try:
+                t = _fetch_base_tile(url, z, tx % n, ty)
+            except Exception:
+                t = np.full((TILE, TILE, 3), 210, np.uint8)
+            row.append(t)
+        rows.append(np.hstack(row))
+    return np.vstack(rows)
+
+
 @st.cache_data(show_spinner="Erzeuge Animation …", max_entries=3)
-def make_animation(tiles, lo, hi, steps, flood_mode, seed_rc, alpha, duration_ms, max_dim=760):
+def make_animation(tiles, lo, hi, steps, flood_mode, seed_rc, alpha, duration_ms,
+                   basemap, hill_mix, max_dim=900):
     dem, _, _ = load_mosaic(*tiles)
     s = max(1, math.ceil(max(dem.shape) / max_dim))
     d = dem[::s, ::s]
     hs = hillshade(d, row_px(tiles, dem.shape[0])[::s] * s)
-    base = np.dstack([(hs * 190 + 50)] * 3).astype(np.float32) / 255.0
+    url, attribution = BASEMAPS_ANIM.get(basemap, (None, ""))
+    if url:
+        bm = base_mosaic(url, *tiles)[::s, ::s][:d.shape[0], :d.shape[1]].astype(np.float32) / 255.0
+        shade = (1.0 - hill_mix) + hill_mix * (0.45 + 0.8 * hs[..., None])
+        base = np.clip(bm * shade, 0, 1)
+    else:
+        base = np.dstack([(hs * 190 + 50)] * 3).astype(np.float32) / 255.0
     seed = (seed_rc[0] // s, seed_rc[1] // s) if seed_rc else None
     dref = max(hi - lo, 1.0)
     font = _font(max(14, d.shape[1] // 32))
+    small = _font(max(10, d.shape[1] // 70))
     frames, pils = [], []
     for lv in np.linspace(lo, hi, steps):
         w = compute_water(d, lv, flood_mode, seed)
@@ -528,6 +573,11 @@ def make_animation(tiles, lo, hi, steps, flood_mode, seed_rc, alpha, duration_ms
         bx = draw.textbbox((0, 0), txt, font=font)
         draw.rectangle([10, 10, 26 + bx[2] - bx[0], 26 + bx[3] - bx[1]], fill=(30, 30, 30))
         draw.text((18 - bx[0], 18 - bx[1]), txt, fill=(255, 255, 255), font=font)
+        if attribution:
+            ab = draw.textbbox((0, 0), attribution, font=small)
+            x0, y0 = img.width - (ab[2] - ab[0]) - 12, img.height - (ab[3] - ab[1]) - 10
+            draw.rectangle([x0 - 4, y0 - 3, img.width - 6, img.height - 5], fill=(255, 255, 255))
+            draw.text((x0 - ab[0], y0 - ab[1]), attribution, fill=(60, 60, 60), font=small)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         frames.append((float(lv), buf.getvalue()))
@@ -1049,14 +1099,20 @@ with t_anim:
     hi = a2.number_input("Bis (m)", LEVEL_MIN, LEVEL_MAX, float(min(LEVEL_MAX, S.level + 100)), 10.0, key="anim_hi")
     steps = a3.slider("Bilder", 6, 40, 16, key="anim_steps")
     speed = a4.select_slider("Tempo", ["langsam", "mittel", "schnell"], value="mittel", key="anim_speed")
+    b1, b2 = st.columns(2)
+    basemap = b1.selectbox("Hintergrund", list(BASEMAPS_ANIM), key="anim_base")
+    hill_mix = b2.slider("Relief darüberlegen", 0.0, 1.0, step=0.05, key="anim_hill",
+                         disabled=basemap == "Nur Relief",
+                         help="0 = reine Karte · 1 = Karte stark plastisch schattiert")
     dur = {"langsam": 700, "mittel": 400, "schnell": 200}[speed]
     if st.button("🎬 Animation für den aktuellen Ausschnitt erzeugen", type="primary"):
         if hi <= lo:
             st.warning("„Bis“ muss größer sein als „Von“.")
         else:
             frames, gif = make_animation(tiles, float(lo), float(hi), int(steps), S.flood_mode, seed_rc,
-                                         float(S.alpha), dur)
+                                         float(S.alpha), dur, basemap, float(hill_mix))
             S.anim = dict(frames=frames, gif=gif)
+            S.anim_idx = 0
     if S.anim:
         g1, g2 = st.columns(2)
         with g1:
@@ -1066,12 +1122,15 @@ with t_anim:
         with g2:
             st.markdown("**⏸ Bild für Bild (angehalten)**")
             n = len(S.anim["frames"])
-            i = st.slider("Bild", 0, n - 1, 0, key="anim_idx",
-                          format="%d", help="Schieberegler bewegen = vor- und zurückspulen")
-            lv_i, png_i = S.anim["frames"][i]
+            if S.get("anim_idx", 0) > n - 1:
+                S.anim_idx = 0
+            i = st.slider("Bild", 0, n - 1, key="anim_idx",
+                          help="Schieberegler bewegen = vor- und zurückspulen")
+            lv_i, png_i = S.anim["frames"][min(i, n - 1)]
             st.image(png_i, caption=f"Wasserstand {de_num(lv_i, 0, True)} m", use_container_width=True)
             st.button("Diesen Wasserstand übernehmen", on_click=set_level, args=(lv_i,))
-        st.caption("Hintergrund: Relief-Schummerung des Ausschnitts. Der Flutungsmodus aus der Sidebar wird verwendet.")
+        st.caption("Die Animation zeigt den aktuellen Kartenausschnitt mit dem Flutungsmodus aus der Sidebar. "
+                   "Nach Änderung von Hintergrund oder Ausschnitt bitte neu erzeugen.")
 
 # =============================================================================
 # Markierungen
@@ -1161,7 +1220,7 @@ with t_help:
 4. **Klick** auf die Karte: Höhe, Wassertiefe, Überlaufhöhe – und als Markierung speichern.
 5. **Profil:** Linien-Werkzeug oben links in der Karte, dann Reiter „📈 Profil“.
 6. **Strandlinien:** Ausschnitt analysieren, Gebiet merken, an anderem Ort wiederholen und vergleichen.
-7. **Animation:** Bereich wählen, erzeugen, als Film ansehen oder Bild für Bild durchgehen.
+7. **Animation:** Bereich und Hintergrund wählen, erzeugen, als Film ansehen oder Bild für Bild durchgehen.
 
 ### Kartenwerkzeuge (oben links)
 ⛶ Vollbild · 📏 Messen (Strecken/Flächen) · ✏️ Linie zeichnen · 🗑️ Linie löschen · unten links Koordinaten.
