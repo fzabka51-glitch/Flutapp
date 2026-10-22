@@ -1,8 +1,9 @@
 # =============================================================================
-# app.py – Flut-App 0.8 · Weltweite Meeresspiegel- und Flutungssimulation
+# app.py – Flut-App 0.9 · Weltweite Meeresspiegel- und Flutungssimulation
 # Eine Datei. Badewannen-Modell auf Basis der AWS Terrain Tiles (inkl. Meeresboden).
-# Neu in 0.8: 3D "Genau wie Karte" (Gelände + Wasser aus demselben Raster, Plotly),
-#             Animation in hoher Qualität (hochaufgelöster Hintergrund, glatte Ufer).
+# Neu in 0.8: Animation in hoher Qualität (hochaufgelöster Hintergrund, glatte Ufer).
+# Neu in 0.9: 3D "Genau wie Karte" als EINE undurchsichtige Oberfläche – Wasser wird
+#             in das Gelände eingefärbt (gleiche Maske wie die 2D-Karte, kein Überlauf).
 # =============================================================================
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import math
 from datetime import datetime
 
 import folium
+import matplotlib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -44,7 +46,7 @@ RS = getattr(Image, "Resampling", Image)
 # =============================================================================
 # Konstanten
 # =============================================================================
-APP_VERSION = "0.8"
+APP_VERSION = "0.9"
 LEVEL_MIN, LEVEL_MAX = -11000.0, 5000.0
 DEFAULT_CENTER = [50.0, 8.0]
 DEFAULT_ZOOM = 5
@@ -81,6 +83,7 @@ COL_BAND = (255, 235, 120)
 TEXTURES_3D = {"Satellit (Esri)": ESRI_URL, "OpenStreetMap": OSM_URL,
                "Gelände (OpenTopoMap)": TOPO_URL, "Ohne (nur Relief)": None}
 TEX_EXACT = ["Satellit (Esri)", "OpenStreetMap", "Gelände (OpenTopoMap)", "Höhenfarben", "Relief (grau)"]
+RES_3D = [150, 200, 250, 300, 350]
 BASEMAPS_ANIM = {"Satellit (Esri)": (ESRI_URL, "© Esri World Imagery"),
                  "OpenStreetMap": (OSM_URL, "© OpenStreetMap-Mitwirkende"),
                  "Gelände (OpenTopoMap)": (TOPO_URL, "© OpenTopoMap, © OSM"),
@@ -107,12 +110,14 @@ for _k, _v in dict(
         hill_on=False, hill_op=0.45, band_on=False, band_m=10.0, l2_on=False, level2=100.0,
         sinks_on=False, sinks_min=2.0, wms_url="", wms_layers="", xyz_url="", ovl_op=0.6,
         markers=[], drawn_line=None, areas={}, anim=None, terr=None,
-        v3d=VIEW3D[0], tex3e=TEX_EXACT[0], exag3e=3.0, res3e=250, walpha3e=0.85,
+        v3d=VIEW3D[0], tex3e=TEX_EXACT[0], exag3e=3.0, res3e=250, walpha3e=0.8,
         tex3d=list(TEXTURES_3D)[0], exag3d=3.0, pitch3d=55, bearing3d=0,
         anim_base=list(BASEMAPS_ANIM)[0], anim_hill=0.3, anim_lo=-100.0, anim_hi=100.0,
         anim_steps=16, anim_speed="mittel", anim_q="Hoch (1400 px)").items():
     if _k not in S:
         S[_k] = _v.copy() if isinstance(_v, (list, dict)) else _v
+if S.res3e not in RES_3D:
+    S.res3e = 250
 
 if not S.get("_qp_done"):
     S["_qp_done"] = True
@@ -317,7 +322,7 @@ def water_rgba(dem, water, level, alpha):
 
 
 def colorize(dem, water, level, mode, alpha, shore):
-    """Gemeinsame Einfärbung für Karte und Animation."""
+    """Gemeinsame Einfärbung für Karte, Animation und 3D."""
     valid = np.isfinite(dem)
     a = int(round(255 * alpha))
     if mode == MODES[0]:
@@ -654,62 +659,70 @@ def anim_player(frames, duration_ms, height=MAP_HEIGHT):
     components.html(html, height=int(height) + 70)
 
 
-# --- 3D "Genau wie Karte" (Plotly, gleiches Raster wie die 2D-Karte) ----------------
+# --- 3D "Genau wie Karte": EINE undurchsichtige Oberfläche ----------------------------
 @st.cache_data(show_spinner="Bereite 3D-Ansicht vor …", max_entries=4)
-def scene_3d(tiles, level, flood_mode, seed_rc, texture, n_max):
+def scene_3d(tiles, level, flood_mode, seed_rc, texture, n_max, mode, alpha, shore):
+    """Gelände als Dreiecksnetz. Wo die 2D-Karte Wasser zeigt (gleiche Maske!), wird die
+    Oberfläche auf den Wasserstand abgeflacht und eingefärbt. Keine Transparenz, kein Überlauf."""
     dem, bounds, _ = load_mosaic(*tiles)
-    water = compute_water(dem, level, flood_mode, seed_rc)
+    water = compute_water(dem, level, flood_mode, seed_rc)          # identisch zur 2D-Karte
     s = max(1, math.ceil(max(dem.shape) / n_max))
     d = dem[::s, ::s]
     w = water[::s, ::s]
-    fill = float(np.nanmin(d)) if np.isfinite(d).any() else 0.0
-    d = np.where(np.isfinite(d), d, fill).astype(np.float32)
+    valid = np.isfinite(d)
+    fill = float(np.nanmin(d)) if valid.any() else 0.0
+    d = np.where(valid, d, fill).astype(np.float32)
     ny, nx = d.shape
-    lat_c = (bounds[0] + bounds[2]) / 2
-    px_km = pixel_size_m(tiles[0]) * s * math.cos(math.radians(lat_c)) / 1000
-    x = np.arange(nx) * px_km
-    y = (ny - 1 - np.arange(ny)) * px_km           # Zeile 0 = Norden
+
+    # Textur (RGB 0..1)
     url = TEXTURES_3D.get(texture)
     if url:
         bm = base_for_area(url, texture, tiles, nx * 2)
-        img = Image.fromarray(bm).resize((nx, ny), RS.LANCZOS).quantize(colors=256)
-        idx = np.asarray(img)
-        pal = np.array(img.getpalette()[:768], dtype=float).reshape(-1, 3)[:int(idx.max()) + 1]
-        order = np.argsort(pal @ np.array([0.299, 0.587, 0.114]))   # nach Helligkeit sortiert
-        rank = np.empty_like(order)
-        rank[order] = np.arange(len(order))
-        nmax = max(len(pal) - 1, 1)
-        sc = rank[idx] / nmax
-        cs = [[i / nmax, f"rgb({int(r)},{int(g)},{int(b)})"] for i, (r, g, b) in enumerate(pal[order])]
-        if len(cs) == 1:
-            cs = [[0, cs[0][1]], [1, cs[0][1]]]
-        cmin, cmax = 0.0, 1.0
+        tex = np.asarray(Image.fromarray(bm).resize((nx, ny), RS.LANCZOS), dtype=np.float32) / 255.0
     elif texture == "Höhenfarben":
-        sc, cs = d, "earth"
-        cmin, cmax = float(np.percentile(d, 2)), float(np.percentile(d, 98)) + 1e-6
+        lo_, hi_ = float(np.percentile(d, 2)), float(np.percentile(d, 98)) + 1e-6
+        tex = matplotlib.colormaps["terrain"](np.clip((d - lo_) / (hi_ - lo_), 0, 1))[..., :3].astype(np.float32)
     else:
-        sc = hillshade(d, row_px(tiles, dem.shape[0])[::s][:ny] * s)
-        cs, cmin, cmax = [[0, "black"], [1, "white"]], 0.0, 1.0
-    return dict(x=x, y=y, d=d, w=w, sc=sc, cs=cs, cmin=cmin, cmax=cmax, s=s)
+        hs = hillshade(d, row_px(tiles, dem.shape[0])[::s][:ny] * s)
+        tex = np.dstack([hs * 0.75 + 0.2] * 3).astype(np.float32)
+
+    # Wasser in denselben Farben wie die Karte darüberlegen
+    top = colorize(d, w, level, mode, alpha, shore).astype(np.float32) / 255.0
+    ta = top[..., 3:4]
+    rgb = np.clip(top[..., :3] * ta + tex * (1 - ta), 0, 1)
+    col = (rgb * 255 + 0.5).astype(np.uint8).reshape(-1, 3)
+    vc = [f"rgb({r},{g},{b})" for r, g, b in col]
+
+    # Höhe: Wasser flach auf Wasserstand, sonst Gelände
+    z = np.where(w, np.float32(level), d)
+
+    lat_c = (bounds[0] + bounds[2]) / 2
+    px_km = pixel_size_m(tiles[0]) * s * math.cos(math.radians(lat_c)) / 1000
+    xs = np.arange(nx) * px_km
+    ys = (ny - 1 - np.arange(ny)) * px_km                           # Zeile 0 = Norden
+    X, Y = np.tile(xs, ny), np.repeat(ys, nx)
+
+    r_, c_ = np.mgrid[0:ny - 1, 0:nx - 1]
+    a = (r_ * nx + c_).ravel()
+    b, cc = a + 1, a + nx
+    dd = cc + 1
+    i = np.concatenate([a, b])
+    j = np.concatenate([b, dd])
+    k = np.concatenate([cc, cc])
+    return dict(X=X, Y=Y, Z=z.ravel(), i=i, j=j, k=k, vc=vc,
+                xr=float(xs.max()) if nx > 1 else 1.0, yr=float(ys.max()) if ny > 1 else 1.0,
+                zmin=float(z.min()), zmax=float(z.max()), n_wet=int(w.sum()), s=s)
 
 
-def plotly_3d(sc, level, exag, walpha, height):
-    x, y, d, w = sc["x"], sc["y"], sc["d"], sc["w"]
-    fig = go.Figure()
-    fig.add_trace(go.Surface(x=x, y=y, z=d, surfacecolor=sc["sc"], colorscale=sc["cs"],
-                             cmin=sc["cmin"], cmax=sc["cmax"], showscale=False, name="Gelände",
-                             lighting=dict(ambient=0.8, diffuse=0.5, specular=0.03, roughness=0.95, fresnel=0.05),
-                             hovertemplate="Ost %{x:.1f} km · Nord %{y:.1f} km<br>Höhe %{z:.0f} m<extra></extra>"))
-    if w.any():
-        wz = np.where(ndimage.binary_dilation(w), level, np.nan)   # bis unter das Ufer, Gelände verdeckt den Rest
-        fig.add_trace(go.Surface(x=x, y=y, z=wz, surfacecolor=np.zeros_like(wz),
-                                 colorscale=[[0, "#1f78d1"], [1, "#1f78d1"]], cmin=0, cmax=1,
-                                 showscale=False, opacity=walpha, name="Wasser",
-                                 lighting=dict(ambient=0.9, diffuse=0.2, specular=0.4, roughness=0.4),
-                                 hovertemplate=f"Wasserstand {level:.0f} m<extra></extra>"))
-    xr, yr = max(float(x.max()), 1e-3), max(float(y.max()), 1e-3)
-    zlo = min(float(d.min()), level) if w.any() else float(d.min())
-    zr = max(float(d.max()) - zlo, 1.0) / 1000 * exag
+def plotly_3d(sc, exag, height):
+    fig = go.Figure(go.Mesh3d(
+        x=sc["X"], y=sc["Y"], z=sc["Z"], i=sc["i"], j=sc["j"], k=sc["k"], vertexcolor=sc["vc"],
+        flatshading=False,
+        lighting=dict(ambient=0.75, diffuse=0.55, specular=0.04, roughness=0.9, fresnel=0.05),
+        lightposition=dict(x=-1e5, y=1e5, z=1e5),
+        hovertemplate="Ost %{x:.1f} km · Nord %{y:.1f} km<br>Höhe / Wasserspiegel %{z:.0f} m<extra></extra>"))
+    xr, yr = max(sc["xr"], 1e-3), max(sc["yr"], 1e-3)
+    zr = max(sc["zmax"] - sc["zmin"], 1.0) / 1000 * exag
     m = max(xr, yr)
     fig.update_layout(height=int(height), margin=dict(l=0, r=0, t=10, b=0), uirevision="3d",
                       scene=dict(aspectmode="manual",
@@ -1109,19 +1122,22 @@ with t_3d:
         c1, c2, c3, c4 = st.columns(4)
         c1.selectbox("Oberfläche", TEX_EXACT, key="tex3e")
         c2.slider("Überhöhung", 1.0, 30.0, step=0.5, key="exag3e")
-        c3.select_slider("Detailgrad (Punkte je Seite)", [150, 250, 350, 450], key="res3e",
-                         help="Höher = schärfer, aber langsamer im Browser.")
-        c4.slider("Deckkraft Wasser", 0.3, 1.0, step=0.05, key="walpha3e")
+        c3.select_slider("Detailgrad (Punkte je Seite)", RES_3D, key="res3e",
+                         help="Höher = schärfer und genauer am Ufer, aber langsamer im Browser.")
+        c4.slider("Deckkraft Wasserfarbe", 0.3, 1.0, step=0.05, key="walpha3e",
+                  help="Wie stark das Satellitenbild unter dem Wasser durchscheint.")
         try:
-            sc3 = scene_3d(tiles, lvl, S.flood_mode, seed_rc, S.tex3e, int(S.res3e))
-            st.plotly_chart(plotly_3d(sc3, lvl, float(S.exag3e), float(S.walpha3e), MAP_HEIGHT),
-                            use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
-            if not sc3["w"].any():
+            sc3 = scene_3d(tiles, lvl, S.flood_mode, seed_rc, S.tex3e, int(S.res3e),
+                           S.mode, round(float(S.walpha3e), 2), bool(S.shore))
+            st.plotly_chart(plotly_3d(sc3, float(S.exag3e), MAP_HEIGHT), use_container_width=True,
+                            config={"scrollZoom": True, "displaylogo": False})
+            if sc3["n_wet"] == 0:
                 st.info("Im aktuellen Ausschnitt steht bei diesem Wasserstand und Modus kein Wasser.")
             st.caption("🖱️ Linke Maustaste = Drehen · Rechte Maustaste = Verschieben · Mausrad = Zoom · "
-                       "Doppelklick = Ansicht zurücksetzen. Gelände **und** Wasser stammen aus demselben "
-                       f"Höhenraster wie die 2D-Karte (Modus: {S.flood_mode.split(' (')[0]}), daher deckungsgleich. "
-                       "Ausschnitt ändern: 2D-Karte verschieben oder zoomen.")
+                       "Doppelklick = Ansicht zurücksetzen. Das Wasser verwendet **dieselbe Maske wie die "
+                       f"2D-Karte** (Modus: {S.flood_mode.split(' (')[0]}) und wird direkt in das Gelände "
+                       "eingefärbt und auf den Wasserstand abgeflacht. Kleine Abweichungen am Ufer kommen nur "
+                       f"vom gröberen 3D-Raster (jeder {sc3['s']}. Punkt) – Detailgrad erhöhen hilft.")
         except Exception as e:
             st.error(f"3D-Ansicht konnte nicht erzeugt werden: {e}")
     else:
@@ -1360,7 +1376,7 @@ with t_help:
 2. **Karte** verschieben und zoomen – das Wasser wird für den sichtbaren Ausschnitt berechnet.
 3. **Flutungsmodus**: Badewanne, vom Kartenrand oder ab angeklicktem Startpunkt.
 4. **Klick** auf die Karte: Höhe, Wassertiefe, Überlaufhöhe – als Markierung speicherbar.
-5. **3D „Genau wie Karte“**: Gelände und Wasser aus denselben Daten wie die 2D-Karte, drehbar und zoombar.
+5. **3D „Genau wie Karte“**: gleiche Wassermaske wie die 2D-Karte, ins Gelände eingefärbt, drehbar und zoombar.
 6. **Profil**: Linien-Werkzeug oben links in der Karte, dann Reiter „📈 Profil“.
 7. **Strandlinien**: Ausschnitt analysieren, Gebiet merken, an anderem Ort wiederholen.
 8. **Animation**: Bereich und Qualität wählen, erzeugen, mit ▶/⏸ abspielen oder Bild für Bild durchgehen.
@@ -1372,6 +1388,7 @@ with t_help:
   das heutige Gelände ist nicht das damalige.
 - **Höhendaten:** AWS Terrain Tiles (Mapzen; u. a. SRTM an Land, ETOPO/GEBCO im Meer). An Land bei starkem Zoom ca.
   30 m Auflösung, Fehler von mehreren Metern möglich. Meeresboden deutlich gröber. Bezug ≈ heutiger Meeresspiegel.
+- **3D „Genau wie Karte“** ist gröber gerastert als die Karte – am Ufer sind kleine Abweichungen möglich.
 - **3D „Fotorealistisch“** lädt das Gelände separat und vereinfacht es – nicht deckungsgleich mit der Karte.
 - **Karten:** © OpenStreetMap-Mitwirkende · Esri World Imagery · OpenTopoMap · Ortssuche: Nominatim (OSM).
 - Seehöhen der Beispielorte sind gerundet.
